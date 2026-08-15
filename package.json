@@ -1,0 +1,14 @@
+{
+  "name": "bgit",
+  "version": "1.0.0-rc.1",
+  "description": "Publish git repositories to BSV as permanent, verifiable, claimable artifacts — and clone them back with stock git.",
+  "type": "module",
+  "license": "MIT",
+  "repository": "github:zcoolz/bgit",
+  "scripts": {
+    "test": "node --test bgit-vectors.test.mjs"
+  },
+  "dependencies": {
+    "@bsv/sdk": "^2.1.0"
+  }
+}
