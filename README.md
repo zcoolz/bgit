@@ -145,10 +145,14 @@ as a spec:
 | What | Where |
 |---|---|
 | Spec repo (the format hosting itself) | repo_id `19Zb3LTpheqZ3XDxJyPEuDcCPyd1re9tWo` |
-| Spec genesis ref | `e79469b288a74af081e92c8356b5aeffc577f52794fd62ce35b6bf6ea6c8d60c` |
+| Spec genesis ref (mined block 962425) | `e79469b288a74af081e92c8356b5aeffc577f52794fd62ce35b6bf6ea6c8d60c` |
 | Monero mirror repo_id | `1DjP78YzJEB7eXKYQ8gyoS4PE2fyzkAHYv` |
-| Monero genesis ref | `[MIRROR_GENESIS_TXID]` |
+| Monero genesis ref (mined block 962429) | `8a6bce9473a0f00e9908ebab35337f08a90a45379fa90c7d567876585d509e57` |
+| Monero artifact manifest (mined block 962429) | `0d9b5db246b3b503cb7b0284c1a803a3e2f6e4f7c2c7904acb9e5eb7f1576929` |
+| The 28 parts | mined blocks 962427–962429; txids resolvable from the artifact manifest |
 | Bundle SHA-256 | `70462ee62fa951558514b8dee54fb265bb677f77ac0401d81c034221c08bb7ed` |
+| Published | 2026-08-15, 30 transactions, ≈40.44M satoshis (≈ $6) |
+| Independent reconstruction | 2026-08-15: rebuilt on a separate machine that had never held this code, via public endpoints only — all 269,600,118 bytes, sha256 byte-identical, `git clone` succeeded |
 
 Reconstruct it yourself with the quickstart above, hash it, and compare. That's the entire trust
 model: don't believe us, check.
