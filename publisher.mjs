@@ -27,6 +27,8 @@ import { join, resolve, dirname, isAbsolute } from 'node:path'
 import { tmpdir } from 'node:os'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+// ONE walker for reader, claim, and --continue (7b7f878e law); acyclic — reader imports nothing from here.
+import { walkSnapshot, SOURCE_PRESETS } from './reader.mjs'
 
 // ---------------------------------------------------------------------------
 // constants (spec-pinned)
@@ -168,8 +170,10 @@ export function buildRefBody ({ repoId, seq, prev, artifactTxid, refsSha256, rol
     artifact: artifactTxid,
     refs_sha256: refsSha256,
     role,
-    claim_how: claimHow,
   }
+  // 7b7f878e: claim_how ONLY on unsigned mirrors — a maintainer ref must not advertise an
+  // invitation that has already been exercised. null claimHow omits the field entirely.
+  if (claimHow != null && role === 'unsigned-mirror') body.claim_how = claimHow
   return Buffer.from(JSON.stringify(body), 'utf8')
 }
 
@@ -231,7 +235,8 @@ export function estimateTxSize (recordLen) {
 export const feeFor = (sizeBytes) => Math.max(1, Math.ceil((sizeBytes * FEE_RATE_SAT_PER_KB) / 1000))
 
 // Build + sign one chained tx: [0] OP_RETURN record · [1] DUST_SATS → repo address · [2] change.
-async function buildTx ({ sdk, privKey, repoAddress, record, prev, changeSats }) {
+// Exported for claim.mjs — ONE tx builder, no second implementation (single-source law).
+export async function buildTx ({ sdk, privKey, repoAddress, record, prev, changeSats }) {
   const { Transaction, P2PKH, Script } = sdk
   const lock = new P2PKH().lock(privKey.toAddress())
   const repoLock = new P2PKH().lock(repoAddress)
@@ -257,7 +262,7 @@ async function buildTx ({ sdk, privKey, repoAddress, record, prev, changeSats })
 
 // Synthetic funding tx for the dry-run fixture chain: spends a fake outpoint, pays the
 // publisher address the full plan amount. NEVER broadcastable (its input does not exist).
-function buildSyntheticFunding ({ sdk, privKey, satoshis }) {
+export function buildSyntheticFunding ({ sdk, privKey, satoshis }) {
   const { Transaction, P2PKH, Script } = sdk
   const fakeOutpoint = sha256hex(Buffer.from('bgit synthetic funding outpoint', 'ascii'))
   const tx = new Transaction()
@@ -295,7 +300,38 @@ export async function runPublisher (opts) {
   }
   if (!wif) throw new Error('need --key-file <publisher-key.json> (or --key <WIF>)')
   const privKey = PrivateKey.fromWif(wif)
-  const repoAddress = privKey.toAddress() // task law: publisher/repo key; its P2PKH address = repo_id
+  const signerAddress = privKey.toAddress()
+  // genesis mode: publisher key IS the repo key (task law). --continue: the repo_id may belong
+  // to a chain the signer does not own the funding of (a claimant extends someone's mirror).
+  const repoAddress = opts.continue ? (opts.repoId || signerAddress) : signerAddress
+  const signerPubkey = Buffer.from(privKey.toPublicKey().encode(true)).toString('hex')
+
+  // ---- --continue: every continuation value derives from ONE immutable walk (7b7f878e) ----
+  let cont = null
+  if (opts.continue) {
+    const snapOpts = { repoId: repoAddress, localIn: opts.chainIn, historyUrl: opts.historyUrl, txUrl: opts.txUrl, source: opts.source }
+    const snap = await walkSnapshot(snapOpts)
+    if (!snap.tipMined) throw new Error('TIP_UNMINED: the current tip is not mined — a continuation binding an unmined tip can become a permanent fork loser; wait for burial')
+    const isGenesis = signerPubkey === snap.genesisPubkey
+    if (!isGenesis && !snap.granted.has(signerPubkey)) {
+      throw new Error('UNAUTHORIZED_KEY: this key is neither the genesis key nor an accepted claimant on this chain — the reader would reject the ref; refusing before any satoshi moves')
+    }
+    // role law (7b7f878e): claimant → FORCED maintainer; genesis chooses (validated) or
+    // inherits the tip's role only when that role is itself well-formed.
+    const ROLE_RE = /^[a-z][a-z0-9-]{0,31}$/
+    let contRole
+    if (!isGenesis) {
+      if (opts.role && opts.role !== 'maintainer') throw new Error('USAGE: an accepted claimant publishes as role "maintainer" — the role is not selectable on a claimed chain')
+      contRole = 'maintainer'
+    } else if (opts.role) {
+      if (!ROLE_RE.test(opts.role)) throw new Error('USAGE: --role must be lowercase [a-z][a-z0-9-]{0,31}')
+      contRole = opts.role
+    } else {
+      contRole = ROLE_RE.test(snap.tipRole || '') ? snap.tipRole : 'unsigned-mirror'
+    }
+    cont = { snap, snapOpts, isGenesis, role: contRole, seq: snap.tipSeq + 1, prevRef: snap.tipTxid }
+    process.stderr.write(`[bgit] --continue: tip seq=${snap.tipSeq} ${snap.tipTxid.slice(0, 12)}… → publishing seq=${cont.seq} as role "${contRole}" (${isGenesis ? 'genesis key' : 'accepted claimant'})\n`)
+  }
   const refsDigest = bundleRefsSha256(bundlePath)
 
   const bundle = readFileSync(bundlePath)
@@ -321,7 +357,12 @@ export async function runPublisher (opts) {
     parts: placeholderParts, bundleRefsSha256: refsDigest, label, specTxid: opts.specTxid, publishedAt,
   }).length
   const refBodySize = buildRefBody({
-    repoId: repoAddress, seq: 1, prev: null, artifactTxid: '0'.repeat(64), refsSha256: refsDigest,
+    repoId: repoAddress,
+    seq: cont ? cont.seq : 1,
+    prev: cont ? cont.prevRef : null,
+    artifactTxid: '0'.repeat(64),
+    refsSha256: refsDigest,
+    role: cont ? cont.role : 'unsigned-mirror',
   }).length
   const envelopeOverhead = (bodyLen) => 2 + encodeVarint(bodyLen).length + 1 + 33 + 1 + 72 // header+varint+0x21+pub+varint+maxDER
 
@@ -336,10 +377,11 @@ export async function runPublisher (opts) {
   const totalSats = totalFee + DUST_SATS * nTx + FINAL_CHANGE_SATS
 
   const plan = {
-    spec: 'BGIT_WIRE_FORMAT_v1 (v1.1)',
+    spec: 'BGIT_WIRE_FORMAT_v1 (v1.3)',
     repo: opts.repo,
     repo_id: repoAddress,
-    fund_address: repoAddress, // publisher key == repo key: fund THIS address
+    fund_address: signerAddress, // genesis: == repo_id. --continue: the SIGNING key gets funded
+    ...(cont ? { continues: { from_seq: cont.snap.tipSeq, prev_ref: cont.prevRef, role: cont.role, snapshot_digest: cont.snap.digest } } : {}),
     bundle: bundlePath,
     artifact_bytes: bundle.length,
     artifact_sha256: artifactSha,
@@ -378,6 +420,19 @@ export async function runPublisher (opts) {
     const { P2PKH } = sdk
     prev = { txid: m[1].toLowerCase(), vout: Number(m[2]), satoshis: Number(m[3]), lockingScript: new P2PKH().lock(privKey.toAddress()) }
     if (prev.satoshis < totalSats) throw new Error(`funding outpoint has ${prev.satoshis} sats; plan needs ${totalSats}`)
+    if (opts.continue) {
+      // 7b7f878e: the funding outpoint must PROVABLY pay the signing key — verified from the
+      // source, never assumed (a claimant funds a continuation from their own coin).
+      const txTpl = opts.txUrl || (opts.source && SOURCE_PRESETS[opts.source] ? SOURCE_PRESETS[opts.source].txUrl : null)
+      if (!txTpl) throw new Error('USAGE: --continue --broadcast needs --tx-url (or --source) to verify the funding outpoint before signing')
+      const fres = await fetch(txTpl.replace('{txid}', prev.txid), { signal: AbortSignal.timeout(60_000) })
+      if (!fres.ok) throw new Error(`FUNDING_UNREADABLE: funding tx fetch → HTTP ${fres.status}`)
+      const ftx = sdk.Transaction.fromHex((await fres.text()).trim())
+      const fout = ftx.outputs[prev.vout]
+      if (!fout) throw new Error(`FUNDING_BAD_OUTPOINT: funding tx has no output ${prev.vout}`)
+      if (fout.satoshis !== prev.satoshis) throw new Error(`FUNDING_VALUE_MISMATCH: outpoint holds ${fout.satoshis} sats, --funding says ${prev.satoshis}`)
+      if (fout.lockingScript.toHex() !== new P2PKH().lock(signerAddress).toHex()) throw new Error('FUNDING_NOT_OURS: the funding outpoint does not pay the signing key')
+    }
   } else {
     const funding = buildSyntheticFunding({ sdk, privKey, satoshis: totalSats })
     writeTx('tx-000-funding', 'funding(synthetic)', { txid: funding.txid, hex: funding.hex, size: funding.hex.length / 2 })
@@ -421,14 +476,21 @@ export async function runPublisher (opts) {
   }
 
   const refBody = buildRefBody({
-    repoId: repoAddress, seq: 1, prev: null, artifactTxid: plan.artifact_manifest_txid, refsSha256: refsDigest,
+    repoId: repoAddress,
+    seq: cont ? cont.seq : 1,
+    prev: cont ? cont.prevRef : null,
+    artifactTxid: plan.artifact_manifest_txid,
+    refsSha256: refsDigest,
+    role: cont ? cont.role : 'unsigned-mirror',
   })
+  let refTxPrev = null // captured for the 7b7f878e mid-publish retarget (rebuild spends the same outpoint)
   {
     const record = signedRecord(TYPE_REF, refBody, privKey)
     const planned = plannedTxs[txIdx]
     const changeSats = prev.satoshis - DUST_SATS - planned.fee
+    refTxPrev = prev
     const built = await buildTx({ sdk, privKey, repoAddress, record, prev, changeSats })
-    const entry = writeTx(`tx-${String(txIdx + 1).padStart(3, '0')}-ref`, 'ref-manifest(seq=1)', built)
+    const entry = writeTx(`tx-${String(txIdx + 1).padStart(3, '0')}-ref`, `ref-manifest(seq=${cont ? cont.seq : 1})`, built)
     entry.fee = prev.satoshis - DUST_SATS - changeSats
     chainRecords.push(entry)
     plan.ref_manifest_txid = built.txid
@@ -482,14 +544,50 @@ export async function runPublisher (opts) {
       txs: files.filter((f) => !f.role.startsWith('funding')).map((f) => ({ txid: f.txid, role: f.role, status: 'UNSENT' })),
     }
     writeFileSync(statePath, JSON.stringify(state, null, 2)) // record intent BEFORE the first send
+    const posted = []
+    let motionChecked = false
     for (const f of files) {
       if (f.role.startsWith('funding')) continue
       if (!outDir) throw new Error('broadcast requires --local-out (the constructed hex is read back from the fixture dir)')
-      const hex = loadVerifiedTxHex(outDir, f) // v1.3: refuse on any drift between plan and bytes
+      if (cont && !motionChecked) {
+        // 7b7f878e: motion check BEFORE the first satoshi moves
+        const s2 = await walkSnapshot(cont.snapOpts)
+        if (s2.digest !== cont.snap.digest) throw new Error(`CHAIN_MOVED: the chain changed between plan and broadcast (tip ${cont.snap.tipTxid.slice(0, 12)}… → ${s2.tipTxid.slice(0, 12)}…) — nothing was sent; re-run --continue for a fresh plan`)
+        motionChecked = true
+      }
+      let hex = loadVerifiedTxHex(outDir, f) // v1.3: refuse on any drift between plan and bytes
+      if (cont && f.role.startsWith('ref-manifest')) {
+        // 7b7f878e REQUIRED CHANGE: the tip can move WHILE parts/artifact broadcast, leaving
+        // this REF a permanent fork loser after the sats are spent. Re-walk immediately before
+        // the REF's POST; retarget when still lawful, refuse (stranded-honest) when not.
+        const s3 = await walkSnapshot(cont.snapOpts)
+        if (s3.digest !== cont.snap.digest) {
+          const stillAuthorized = cont.isGenesis ? s3.genesisPubkey === signerPubkey : s3.granted.has(signerPubkey)
+          if (!s3.tipMined || !stillAuthorized) {
+            throw new Error(`CHAIN_MOVED: the chain moved mid-publish and the continuation is no longer lawful (${!s3.tipMined ? 'the new tip is unmined' : 'this key is no longer authorized at the tip'}). Already-posted data txs are honest PENDING strands, reusable by a fresh --continue: ${posted.join(', ') || '(none)'}`)
+          }
+          process.stderr.write(`[bgit] chain moved mid-publish — retargeting REF: seq ${cont.seq}→${s3.tipSeq + 1}, prev ${cont.prevRef.slice(0, 12)}…→${s3.tipTxid.slice(0, 12)}…\n`)
+          const newBody = buildRefBody({ repoId: repoAddress, seq: s3.tipSeq + 1, prev: s3.tipTxid, artifactTxid: plan.artifact_manifest_txid, refsSha256: refsDigest, role: cont.role })
+          const newRecord = signedRecord(TYPE_REF, newBody, privKey)
+          const newFee = feeFor(estimateTxSize(newRecord.length))
+          const rebuilt = await buildTx({ sdk, privKey, repoAddress, record: newRecord, prev: refTxPrev, changeSats: refTxPrev.satoshis - DUST_SATS - newFee })
+          writeFileSync(join(outDir, f.file), rebuilt.hex)
+          const oldRow = state.txs.find((t) => t.txid === f.txid)
+          oldRow.status = 'SUPERSEDED(retarget)'
+          oldRow.superseded_by = rebuilt.txid
+          state.txs.push({ txid: rebuilt.txid, role: `ref-manifest(seq=${s3.tipSeq + 1},retargeted)`, status: 'UNSENT' })
+          f.txid = rebuilt.txid
+          f.role = `ref-manifest(seq=${s3.tipSeq + 1},retargeted)`
+          plan.ref_manifest_txid = rebuilt.txid
+          writeFileSync(statePath, JSON.stringify(state, null, 2))
+          hex = loadVerifiedTxHex(outDir, f) // the drift gate re-proves the REBUILT bytes too
+        }
+      }
       const r = await broadcastOne(hex, bridges)
       const row = state.txs.find((t) => t.txid === f.txid)
       row.status = 'PENDING' // relay ack is NOT acceptance — only --confirm may promote (only-mined law)
       row.relay = r
+      posted.push(f.txid)
       writeFileSync(statePath, JSON.stringify(state, null, 2))
       console.log(`PENDING ${f.txid} (${f.role}) — relay ack from ${r.bridge}; acceptance unknown until mined`)
     }
@@ -516,7 +614,7 @@ export function loadVerifiedTxHex (dir, entry) {
   return hex
 }
 
-async function broadcastOne (rawTxHex, bridges) {
+export async function broadcastOne (rawTxHex, bridges) {
   let lastErr = null
   for (const url of bridges) {
     try {
@@ -593,6 +691,13 @@ function parseArgs (argv) {
       case '--funding': o.funding = next(); break
       case '--bridge': o.bridges.push(next()); break
       case '--state': o.state = next(); break
+      case '--continue': o.continue = true; break
+      case '--repo-id': o.repoId = next(); break
+      case '--chain-in': o.chainIn = next(); break
+      case '--history-url': o.historyUrl = next(); break
+      case '--tx-url': o.txUrl = next(); break
+      case '--source': o.source = next(); break
+      case '--role': o.role = next(); break
       case '--status-url': o.statusUrl = next(); break
       case '--confirm': o.confirm = true; break
       default: throw new Error(`unknown flag: ${a}`)

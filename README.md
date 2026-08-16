@@ -10,7 +10,9 @@ your code to survive.
 ## Why this exists
 
 In August 2026, India ordered GitHub to delete repositories on three hours' notice. The same
-season, Codeberg evicted every cryptocurrency project it hosted. On a Monero community podcast,
+season, Codeberg's new terms banned cryptocurrency projects from its platform — and, in the same
+vote, code written mostly by AI, naming Claude and Codex. (This repository, built with both,
+would be banned twice.) On a Monero community podcast,
 someone asked the obvious question — *"can we just store it on BSV?"* — and nobody in the room
 had an answer.
 
@@ -70,6 +72,21 @@ node publisher.mjs --bundle myrepo.bundle --repo you/myrepo \
   --broadcast --funding <txid>:<vout>:<sats> --bridge <your broadcast endpoint>
 ```
 
+**Updating a published repository** — `--continue` publishes a new bundle onto an existing
+chain:
+
+```
+node publisher.mjs --bundle updated.bundle --repo you/myrepo --key-file key.json \
+  --continue --history-url '<tpl>' --tx-url '<tpl>' --local-out ./fixture
+```
+
+The publisher walks the chain itself, derives `seq`/`prev` from the resolved tip (no flag can
+supply them), and refuses — before any satoshi moves — if the signing key is neither the
+genesis key nor an accepted claimant. A claimant's refs are forced to `role: "maintainer"`,
+and if the chain moves *while* a multi-transaction publish is broadcasting, the final ref
+manifest is re-derived against the new tip or refused with the already-posted data honestly
+reported — never left as a silent fork loser.
+
 Dry-run is the default; broadcasting requires the explicit flag *and* a named coin. Every
 transaction is built, hashed, and persisted to disk before the first broadcast — if anything dies
 mid-publish, you re-run and already-mined transactions simply confirm. Immediately before each
@@ -91,6 +108,23 @@ records themselves**: a maintainer proves control of the project's canonical dom
 signed claim attestation on chain, and from that moment the repository's ref chain is theirs —
 permanently, under a first-claim-per-key law with deterministic fork resolution. No permission
 from us, no deadline, and it works even if every server we run is gone. Their code, their claim.
+
+**Claiming is one command** (`claim.mjs`, in this repo):
+
+```
+node claim.mjs --repo-id <the repo address> --key-file maintainer-key.json \
+  --domain yourproject.org --history-url '<tpl>' --tx-url '<tpl>'
+```
+
+Dry-run by default: it walks the repository with the real reader (complete-or-refuse), derives
+the current tip itself — you cannot cite a stale one — and prints the exact
+`/.well-known/bgit` file you must host at your canonical domain. With that file live, add
+`--broadcast --funding <txid>:<vout>:<sats> --bridge <endpoint>`: the verb fetches and receipts
+your evidence, re-checks it and re-walks the chain immediately before sending, and refuses —
+by name — every situation that would waste your satoshis (already claimed, chain moved,
+evidence missing, funding that isn't yours, ambiguous mined order). Every txid reports PENDING;
+only the separate `--confirm` pass may say accepted. The claim's durable half lives on chain;
+a domain that later dies does not un-claim a repository.
 
 ## The trial record — three adversarial rounds before one byte was broadcast
 

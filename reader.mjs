@@ -709,6 +709,7 @@ export function refsDigestOfBundle (bundlePath) {
 function refusal (code, detail) {
   const e = new Error(`BGIT_REFUSED ${code}${detail ? `: ${detail}` : ''}`)
   e.bgitCode = code
+  e.code = code // the claim/continue dialect reads .code — one refusal shape, two spellings
   return e
 }
 
@@ -741,7 +742,7 @@ async function fetchText (url) {
 // SPEC-AMBIGUITY[13]: §3.3 defines mined order as height THEN tx index within the block, but
 // common address-history APIs expose no intra-block index. Chosen: sort by height; same-height
 // ties keep source order, and same-height REF-manifest ties are DISCLOSED in the report.
-async function readNetworkTxs (historyUrl, txUrl, repoId) {
+export async function readNetworkTxs (historyUrl, txUrl, repoId) {
   const histText = await fetchText(historyUrl.replace('{address}', encodeURIComponent(repoId)))
   let hist
   try { hist = JSON.parse(histText) } catch { throw refusal('SOURCE_UNREADABLE', 'history response is not JSON') }
@@ -763,6 +764,60 @@ async function readNetworkTxs (historyUrl, txUrl, repoId) {
     txs.push({ sourceTxid: r.txid, mined: r.height !== null, height: r.height, raw: Buffer.from(hex, 'hex') })
   }
   return txs
+}
+
+// ---------------------------------------------------------------------------
+// walkSnapshot — ONE immutable read of a repo chain; every claim/continue
+// decision derives from it (codex-crypto b81a4643 + 7b7f878e: tip role and
+// grant PROVENANCE ride the digest, so authority changes count as motion).
+// Consumers: claim.mjs (the claim verb) and publisher.mjs --continue.
+// ---------------------------------------------------------------------------
+export async function walkSnapshot ({ repoId, localIn, historyUrl, txUrl, source }) {
+  let txs, orderAuthoritative
+  if (localIn) {
+    const src = readLocalTxs(resolve(localIn))
+    txs = src.txs
+    orderAuthoritative = src.orderAuthoritative
+  } else {
+    let h = historyUrl; let t = txUrl
+    if (source) {
+      const p = SOURCE_PRESETS[source]
+      if (!p) throw refusal('USAGE', `unknown --source ${source} (have: ${Object.keys(SOURCE_PRESETS).join(', ')})`)
+      h = h || p.historyUrl
+      t = t || p.txUrl
+    }
+    if (!h || !t) throw refusal('USAGE', 'need --local-in OR (--history-url AND --tx-url) OR --source <preset>')
+    txs = await readNetworkTxs(h, t, repoId)
+    orderAuthoritative = false
+  }
+  const col = collectRecords(txs, repoId)
+  const { chain, tip, report, claimResults } = resolveChain(col.refs, col.claims, { orderAuthoritative })
+  if (!tip) throw refusal('NO_GENESIS', `no valid seq=1 REF MANIFEST for ${repoId} — a chain this walk cannot verify is a chain nothing may act on`)
+  if (report.ambiguousSameBlock.length) {
+    const a = report.ambiguousSameBlock[0]
+    throw refusal('AMBIGUOUS_MINED_ORDER', `order-dependent verdict at height ${a.height} and this source has no intra-block index — re-read from a source with block data before acting`)
+  }
+  const granted = new Set(report.authTimeline.map((a) => a.pubkey))
+  const genesisPubkey = report.keyLineage.length ? report.keyLineage[0].pubkey : (report.authTimeline.find((a) => a.always) || {}).pubkey
+  const accepted = claimResults.filter((c) => c.status === 'ACCEPTED').map((c) => c.txid).sort()
+  // provenance: genesis-vs-claimant distinction is part of the immutable state (7b7f878e)
+  const provenance = report.authTimeline
+    .map((a) => ({ pubkey: a.pubkey, always: !!a.always, source: a.source || null }))
+    .sort((x, y) => (x.pubkey < y.pubkey ? -1 : 1))
+  return {
+    txCount: txs.length,
+    tipTxid: tip.txid,
+    tipSeq: tip.seq,
+    tipRole: typeof tip.role === 'string' ? tip.role : null,
+    tipPubkey: tip.pubkey || null,
+    tipMined: tip.mined !== false,
+    genesisPubkey,
+    granted,
+    acceptedClaims: accepted,
+    digest: createHash('sha256').update(JSON.stringify({
+      tip: tip.txid, tipRole: typeof tip.role === 'string' ? tip.role : null, provenance, accepted,
+    })).digest('hex'),
+  }
 }
 
 // ---------------------------------------------------------------------------

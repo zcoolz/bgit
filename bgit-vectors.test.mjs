@@ -149,8 +149,10 @@ function makeBrokenCopy (modulePath, target, replacement) {
   const src = readFileSync(modulePath, 'utf8')
   assert.ok(src.includes(target), `bite target present in module source: ${JSON.stringify(target.slice(0, 70))}`)
   assert.strictEqual(src.indexOf(target), src.lastIndexOf(target), 'bite target is unique in the module source')
-  const broken = src.replace(target, replacement)
+  let broken = src.replace(target, replacement)
   assert.notStrictEqual(broken, src, 'the break actually landed (a silent no-op replace proves nothing)')
+  // the copy lives in tmp — repoint relative sibling imports at the REAL modules
+  broken = broken.replace(/from '\.\/(reader|publisher|claim)\.mjs'/g, (_, m) => `from '${pathToFileURL(join(HERE, `${m}.mjs`)).href}'`)
   const out = join(ROOT, `broken-${++brokenN}-${modulePath.endsWith('reader.mjs') ? 'reader' : 'publisher'}.mjs`)
   writeFileSync(out, broken)
   return out
@@ -763,7 +765,7 @@ test('14. PIN: broadcast refuses fixture bytes that drift from the plan', () => 
 
   // structural pin: the ONE broadcast call site is fed exclusively by the verifying loader
   const src = readFileSync(join(HERE, 'publisher.mjs'), 'utf8')
-  assert.match(src, /const hex = loadVerifiedTxHex\(outDir, f\)/)
+  assert.match(src, /let hex = loadVerifiedTxHex\(outDir, f\)/)
   assert.strictEqual((src.match(/await broadcastOne\(/g) || []).length, 1, 'one broadcast call site, fed by the verified loader')
 })
 
@@ -921,4 +923,250 @@ test('17. PIN (r3-c): FIRST-CLAIM PERMANENCE — repeat claims by an authorized 
   assert.strictEqual(grantsFull[0].source, C1.txid, 'permanently anchored at the FIRST accepted claim')
   assert.deepStrictEqual(resFull.report.authTimeline, resBase.report.authTimeline, 'the WHOLE authority timeline is unchanged')
   assert.deepStrictEqual(resFull.chain.map((r) => r.txid), resBase.chain.map((r) => r.txid), 'and the resolved chain is unchanged')
+})
+
+// ===========================================================================
+// THE CLAIM VERB (claim.mjs) — gates V1–V4 per the codex-crypto verdict
+// (wire b81a4643, BUILD-WITH-CHANGES, all changes folded). V4 = every vector
+// above re-running untouched in this same file.
+// ===========================================================================
+const clm = await import('./claim.mjs')
+
+test('18. CLAIM VERB V1: body byte-vector vs a hand-built second implementation; envelope verifies as 0x06', () => {
+  const M = new sdk.PrivateKey(sha256hex(Buffer.from('bgit claim verb maintainer', 'ascii')), 16)
+  const mp = Buffer.from(M.toPublicKey().encode(true)).toString('hex')
+  const tgt = FAKE64(77)
+  const body = clm.buildClaimBody({ repoId: repoAddr, maintainerPubkey: mp, domain: 'getmonero.org', targetRef: tgt })
+  // second implementation: the literal JSON string in the spec's exact field order
+  const hand = `{"bgit":1,"repo_id":"${repoAddr}","maintainer_pubkey":"${mp}","domain":"getmonero.org","role":"maintainer","target_ref":"${tgt}"}`
+  assert.strictEqual(body.toString('utf8'), hand, 'claim body bytes match the hand-built spec sample exactly')
+  const rec = pub.signedRecord(pub.TYPE_CLAIM, body, M)
+  assert.strictEqual(rec[0], 0x01); assert.strictEqual(rec[1], pub.TYPE_CLAIM)
+  const v = rdr.validateSignedRecord(rec.subarray(2), { version: rec[0], type: rec[1] })
+  assert.strictEqual(v.ok, true, `reader verifies the verb-built 0x06: ${v.code || ''}`)
+  assert.ok(v.body.equals(body), 'reader-validated 0x06 envelope carries the literal body bytes')
+  const wk = clm.wellKnownExpected({ repoId: repoAddr, maintainerPubkey: mp, domain: 'getmonero.org' })
+  assert.strictEqual(wk.url, 'https://getmonero.org/.well-known/bgit')
+  const pj = JSON.parse(wk.content)
+  assert.strictEqual(pj.repo_id, repoAddr)
+  assert.strictEqual(pj.maintainer_pubkey, mp)
+})
+
+test('18b. CLAIM VERB V3 (pure lattice): genesis / already-authorized / unmined-tip refuse; domain law', () => {
+  const snapBase = { tipMined: true, tipTxid: FAKE64(5), genesisPubkey: '02' + 'aa'.repeat(32), granted: new Set(['02' + 'bb'.repeat(32)]) }
+  const freshKey = '02' + 'cc'.repeat(32)
+  const codeOf = (fn) => { try { fn(); return null } catch (e) { return e.code } }
+  assert.strictEqual(codeOf(() => clm.claimPreconditions(snapBase, snapBase.genesisPubkey)), 'GENESIS_NEEDS_NO_CLAIM')
+  assert.strictEqual(codeOf(() => clm.claimPreconditions(snapBase, '02' + 'bb'.repeat(32))), 'ALREADY_AUTHORIZED')
+  assert.strictEqual(codeOf(() => clm.claimPreconditions({ ...snapBase, tipMined: false }, freshKey)), 'TIP_UNMINED')
+  assert.strictEqual(codeOf(() => clm.claimPreconditions(snapBase, freshKey)), null, 'a fresh key on a mined tip passes')
+  for (const bad of ['GetMonero.org', 'https://x.com', 'x.com/path', 'localhost', 'a_b.com', '', 'x.', '.x'])
+    assert.ok(!clm.validDomain(bad), `domain rejected: ${JSON.stringify(bad)}`)
+  for (const ok of ['getmonero.org', 'wownero.org', 'a.b.c.example', 'xn--gckvb8fzb.com'])
+    assert.ok(clm.validDomain(ok), `domain accepted: ${ok}`)
+})
+
+test('19. CLAIM VERB V2 (EXECUTION): claim built THROUGH THE VERB, real reader prefers the maintainer chain; mined-order law both ways', async () => {
+  const fx = realFixture()
+  // ground truth about the un-claimed fixture from the reader's own machinery
+  const src = rdr.readLocalTxs(fx.outDir)
+  const col = rdr.collectRecords(src.txs, repoAddr)
+  const rc = rdr.resolveChain(col.refs, col.claims, { orderAuthoritative: src.orderAuthoritative })
+
+  const B = new sdk.PrivateKey(sha256hex(Buffer.from('claim verb key B', 'ascii')), 16)
+  const Bpub = Buffer.from(B.toPublicKey().encode(true)).toString('hex')
+  const planDir = join(ROOT, 'claim-plan')
+  const res = await clm.runClaim({ repoId: repoAddr, key: B.toWif(), domain: 'getmonero.org', localIn: fx.outDir, out: planDir, bridges: [] })
+  assert.strictEqual(res.broadcast, false, 'fixture universe is dry-run only')
+  assert.strictEqual(res.plan.target_ref, rc.tip.txid, 'target_ref = the reader-resolved mined tip, never hand-supplied')
+  const planText = readFileSync(join(planDir, 'claim-plan.json'), 'utf8')
+  assert.ok(!planText.includes(B.toWif()), 'no key material in the plan')
+  assert.ok(existsSync(join(planDir, 'claim-record.hex')) && existsSync(join(planDir, 'well-known-expected.json')))
+
+  // compose the verb's OWN record onto the chain (dust-to-repo per §5), then key B's maintainer ref
+  const claimRaw = rawTx([{ sats: 0, script: pub.recordScript(res.record) }, { sats: 10, script: repoScript }])
+  const claimTxid2 = txidOf(claimRaw)
+  const mref = refTx({ seq: rc.tip.seq + 1, prev: rc.tip.txid, artifact: rc.tip.artifact, refsSha: rc.tip.refs_sha256, role: 'maintainer', key: B })
+
+  const mkExtended = (name, order) => {
+    const dir = join(ROOT, name)
+    const chain = cloneChainDir(fx.outDir, dir)
+    for (const [txid, raw, file] of order) {
+      writeFileSync(join(dir, file), raw.toString('hex'))
+      chain.entries.push({ txid, file })
+    }
+    writeFileSync(join(dir, 'chain.json'), JSON.stringify(chain, null, 2))
+    return dir
+  }
+
+  // POSITIVE: claim mined BEFORE the maintainer ref (entry order = mined order, authoritative)
+  const dirGood = mkExtended('fixture-claimed', [[claimTxid2, claimRaw, 'claim.hex'], [mref.txid, mref.raw, 'mref.hex']])
+  const rep = await rdr.runReader({ repoId: repoAddr, localIn: dirGood, out: join(ROOT, 'out-claimed.bundle'), quiet: true })
+  assert.strictEqual(rep.tip.txid, mref.txid, 'the REAL reader now serves the maintainer chain')
+  assert.strictEqual(rep.tip.pubkey, Bpub, 'tip signed by the claimant key')
+  assert.ok(rep.claims.some((c) => c.txid === claimTxid2 && c.status === 'ACCEPTED'), 'the verb-built claim is ACCEPTED by the reader')
+  assert.strictEqual(sha256hex(readFileSync(join(ROOT, 'out-claimed.bundle'))), fx.bundleSha, 'the artifact still reconstructs byte-identical under the maintainer chain')
+
+  // RED CONTROL: same records, maintainer ref mined BEFORE the claim — unauthorized at its time
+  const dirBad = mkExtended('fixture-claim-red', [[mref.txid, mref.raw, 'mref.hex'], [claimTxid2, claimRaw, 'claim.hex']])
+  const src2 = rdr.readLocalTxs(dirBad)
+  const col2 = rdr.collectRecords(src2.txs, repoAddr)
+  const rc2 = rdr.resolveChain(col2.refs, col2.claims, { orderAuthoritative: src2.orderAuthoritative })
+  assert.strictEqual(rc2.tip.txid, rc.tip.txid, 'RED: the maintainer ref does NOT take the tip when mined before its claim')
+  assert.ok(rc2.report.unauthorized.some((u) => u.txid === mref.txid), 'RED: the early ref is rejected as unauthorized — mined order is the law, not array luck')
+})
+
+test('20. CLAIM VERB V3 (through the verb): already-authorized, genesis, fixture-broadcast, no-genesis, bad-domain all refuse', async () => {
+  const fx = realFixture()
+  const B = new sdk.PrivateKey(sha256hex(Buffer.from('claim verb key B', 'ascii')), 16)
+  const codeOf = async (p) => { try { await p; return null } catch (e) { return e.code } }
+  // on the CLAIMED chain from vector 19, key B already holds the grant
+  assert.strictEqual(await codeOf(clm.runClaim({ repoId: repoAddr, key: B.toWif(), domain: 'getmonero.org', localIn: join(ROOT, 'fixture-claimed') })), 'ALREADY_AUTHORIZED')
+  // the genesis key needs no claim
+  assert.strictEqual(await codeOf(clm.runClaim({ repoId: repoAddr, key: repoKey.toWif(), domain: 'getmonero.org', localIn: fx.outDir })), 'GENESIS_NEEDS_NO_CLAIM')
+  // the fixture seam has no broadcast path, structurally
+  assert.strictEqual(await codeOf(clm.runClaim({ repoId: repoAddr, key: B.toWif(), domain: 'getmonero.org', localIn: fx.outDir, broadcast: true, funding: `${FAKE64(1)}:0:100000`, bridges: ['http://127.0.0.1:1/x'] })), 'FIXTURE_CANNOT_BROADCAST')
+  // an unverifiable repo is never claimed
+  const emptyDir = join(ROOT, 'fixture-empty')
+  mkdirSync(emptyDir, { recursive: true })
+  writeFileSync(join(emptyDir, 'chain.json'), JSON.stringify({ entries: [] }))
+  assert.strictEqual(await codeOf(clm.runClaim({ repoId: repoAddr, key: B.toWif(), domain: 'getmonero.org', localIn: emptyDir })), 'NO_GENESIS')
+  // domain law at the door
+  assert.strictEqual(await codeOf(clm.runClaim({ repoId: repoAddr, key: B.toWif(), domain: 'https://x.com', localIn: fx.outDir })), 'BAD_DOMAIN')
+})
+
+test('21. CLAIM VERB source pins: no tip override exists; evidence fetched twice before broadcast; no bypass flag; CLI refuses bare', () => {
+  const srcText = readFileSync(join(HERE, 'claim.mjs'), 'utf8')
+  assert.ok(!srcText.includes('--assume-tip'), 'PIN: no CLI tip override exists — target_ref derives from the walk, always')
+  assert.ok(!/skip-evidence/i.test(srcText), 'PIN: no production evidence-bypass flag')
+  const iEv1 = srcText.indexOf('const ev1 = await fetchEvidence')
+  const iSnap2 = srcText.indexOf('const snap2 = await walkSnapshot')
+  const iEv2 = srcText.indexOf('const ev2 = await fetchEvidence')
+  const iBcast = srcText.indexOf('await broadcastOne(')
+  assert.ok(iEv1 > 0 && iSnap2 > iEv1 && iEv2 > iSnap2 && iBcast > iEv2,
+    'PIN: order is evidence, re-walk (CHAIN_MOVED), evidence re-check (EVIDENCE_LOST), broadcast')
+  assert.ok(srcText.includes('EVIDENCE_MISSING') && srcText.includes('EVIDENCE_LOST') && srcText.includes('CHAIN_MOVED'))
+  assert.ok(srcText.includes('FUNDING_NOT_OURS'), 'PIN: the funding outpoint must pay the claim key')
+  const r = runCli(join(HERE, 'claim.mjs'), [])
+  assert.notStrictEqual(r.status, 0, 'bare CLI refuses with usage')
+})
+
+// ===========================================================================
+// PUBLISHER --continue (part 2) — gates G1–G5 per codex-crypto 7b7f878e
+// (BUILD-WITH-CHANGES, all folded incl. the mid-publish REF race). G5 = every
+// vector above re-running untouched.
+// ===========================================================================
+
+test('22. CONTINUE G1 (EXECUTION): genesis publishes seq=2 with a NEW bundle; real reader serves the new tip + new artifact; claim_how law', async () => {
+  const fx = realFixture()
+  const repo2 = makeRepoBundle({ commits: 6, filler: 500 })
+  const repo2sha = sha256hex(readFileSync(repo2.bundlePath))
+  const contDir = join(ROOT, 'continue-genesis')
+  const r = runCli(join(HERE, 'publisher.mjs'), [
+    '--bundle', repo2.bundlePath, '--repo', 'test/real', '--key', repoKey.toWif(),
+    '--part-bytes', '700', '--local-out', contDir, '--continue', '--chain-in', fx.outDir,
+  ])
+  assert.strictEqual(r.status, 0, `continue publisher: ${r.stderr}`)
+  const contChain = JSON.parse(readFileSync(join(contDir, 'chain.json'), 'utf8'))
+  assert.strictEqual(contChain.plan.continues.from_seq, 1, 'plan discloses what it continues from')
+  assert.strictEqual(contChain.plan.continues.role, 'unsigned-mirror', 'genesis inherits the validated tip role')
+
+  // merge base + continuation into one walk (synthetic funding txs are non-records, ignored)
+  const merged = join(ROOT, 'merged-genesis')
+  const baseChain = cloneChainDir(fx.outDir, merged)
+  for (const e of contChain.entries) {
+    writeFileSync(join(merged, 'c-' + e.file), readFileSync(join(contDir, e.file)))
+    baseChain.entries.push({ txid: e.txid, file: 'c-' + e.file })
+  }
+  writeFileSync(join(merged, 'chain.json'), JSON.stringify(baseChain, null, 2))
+  const out2 = join(ROOT, 'out-continued.bundle')
+  const rep = await rdr.runReader({ repoId: repoAddr, localIn: merged, out: out2, quiet: true })
+  assert.strictEqual(rep.tip.seq, 2, 'the reader serves the continuation tip')
+  assert.strictEqual(rep.tip.txid, contChain.plan.ref_manifest_txid)
+  assert.strictEqual(sha256hex(readFileSync(out2)), repo2sha, 'the NEW bundle reconstructs byte-identical')
+
+  // claim_how law (7b7f878e): invitation on unsigned mirrors ONLY
+  const bodyU = JSON.parse(pub.buildRefBody({ repoId: repoAddr, seq: 2, prev: FAKE64(1), artifactTxid: FAKE64(2), refsSha256: FAKE64(3) }).toString('utf8'))
+  assert.ok(bodyU.claim_how, 'unsigned-mirror refs carry the claim invitation')
+  const bodyM = JSON.parse(pub.buildRefBody({ repoId: repoAddr, seq: 2, prev: FAKE64(1), artifactTxid: FAKE64(2), refsSha256: FAKE64(3), role: 'maintainer' }).toString('utf8'))
+  assert.strictEqual(bodyM.claim_how, undefined, 'maintainer refs must not advertise an exercised invitation')
+})
+
+test('22b. CONTINUE G2 (EXECUTION): an accepted claimant continues as FORCED maintainer; role not selectable; unauthorized key refused pre-spend', async () => {
+  const fx = realFixture()
+  const B = new sdk.PrivateKey(sha256hex(Buffer.from('claim verb key B', 'ascii')), 16)
+  const Bpub = Buffer.from(B.toPublicKey().encode(true)).toString('hex')
+  const claimedDir = join(ROOT, 'fixture-claimed') // from vector 19: base + accepted claim + B's seq=2 maintainer ref
+  const repo3 = makeRepoBundle({ commits: 2, filler: 300 })
+  const repo3sha = sha256hex(readFileSync(repo3.bundlePath))
+  const contDir = join(ROOT, 'continue-claimant')
+  const r = runCli(join(HERE, 'publisher.mjs'), [
+    '--bundle', repo3.bundlePath, '--repo', 'test/real', '--key', B.toWif(),
+    '--part-bytes', '700', '--local-out', contDir, '--continue', '--chain-in', claimedDir, '--repo-id', repoAddr,
+  ])
+  assert.strictEqual(r.status, 0, `claimant continue: ${r.stderr}`)
+  const contChain = JSON.parse(readFileSync(join(contDir, 'chain.json'), 'utf8'))
+  assert.strictEqual(contChain.plan.continues.role, 'maintainer', 'claimant role is FORCED maintainer')
+  assert.strictEqual(contChain.plan.continues.from_seq, 2)
+  assert.strictEqual(contChain.plan.repo_id, repoAddr, 'repo_id stays the CHAIN address, not the claimant address')
+  assert.notStrictEqual(contChain.plan.fund_address, repoAddr, 'the claimant funds from their OWN key')
+
+  const merged = join(ROOT, 'merged-claimant')
+  const baseChain = cloneChainDir(claimedDir, merged)
+  for (const e of contChain.entries) {
+    writeFileSync(join(merged, 'c-' + e.file), readFileSync(join(contDir, e.file)))
+    baseChain.entries.push({ txid: e.txid, file: 'c-' + e.file })
+  }
+  writeFileSync(join(merged, 'chain.json'), JSON.stringify(baseChain, null, 2))
+  const out3 = join(ROOT, 'out-claimant-continued.bundle')
+  const rep = await rdr.runReader({ repoId: repoAddr, localIn: merged, out: out3, quiet: true })
+  assert.strictEqual(rep.tip.seq, 3, 'maintainer chain extends')
+  assert.strictEqual(rep.tip.pubkey, Bpub, 'tip signed by the claimant')
+  assert.strictEqual(rep.tip.role, 'maintainer')
+  assert.strictEqual(sha256hex(readFileSync(out3)), repo3sha, 'claimant update reconstructs byte-identical')
+
+  // role is not selectable on a claimed chain
+  const r2 = runCli(join(HERE, 'publisher.mjs'), [
+    '--bundle', repo3.bundlePath, '--repo', 'test/real', '--key', B.toWif(),
+    '--local-out', join(ROOT, 'x-role'), '--continue', '--chain-in', claimedDir, '--repo-id', repoAddr, '--role', 'tip',
+  ])
+  assert.notStrictEqual(r2.status, 0)
+  assert.ok(/not selectable/.test(r2.stderr), `refusal names the law: ${r2.stderr.slice(0, 200)}`)
+
+  // an unauthorized key refuses BEFORE any satoshi would move
+  const C = new sdk.PrivateKey(sha256hex(Buffer.from('unauthorized key C', 'ascii')), 16)
+  const r3 = runCli(join(HERE, 'publisher.mjs'), [
+    '--bundle', repo3.bundlePath, '--repo', 'test/real', '--key', C.toWif(),
+    '--local-out', join(ROOT, 'x-unauth'), '--continue', '--chain-in', fx.outDir, '--repo-id', repoAddr,
+  ])
+  assert.notStrictEqual(r3.status, 0)
+  assert.ok(/UNAUTHORIZED_KEY/.test(r3.stderr), `refusal is typed: ${r3.stderr.slice(0, 200)}`)
+})
+
+test('23. CONTINUE G3/G4: unmined-tip walk refuses; seq/prev underivable by flag; broadcast motion-check order + retarget pinned in source', () => {
+  const fx = realFixture()
+  // a chain whose only ref is unmined cannot be continued (refuses in the walk, pre-spend)
+  const dir = join(ROOT, 'fixture-unmined')
+  const chain = cloneChainDir(fx.outDir, dir)
+  chain.entries[chain.entries.length - 1].mined = false // the ref manifest
+  writeFileSync(join(dir, 'chain.json'), JSON.stringify(chain, null, 2))
+  const repo4 = makeRepoBundle({ commits: 2 })
+  const r = runCli(join(HERE, 'publisher.mjs'), [
+    '--bundle', repo4.bundlePath, '--repo', 'test/real', '--key', repoKey.toWif(),
+    '--local-out', join(ROOT, 'x-unmined'), '--continue', '--chain-in', dir,
+  ])
+  assert.notStrictEqual(r.status, 0, 'an unmined tip is not a continuation base')
+  assert.ok(/TIP_UNMINED|NO_GENESIS/.test(r.stderr), `typed refusal: ${r.stderr.slice(0, 200)}`)
+
+  // G4: seq/prev derive from the walk — no flag can supply them
+  const src = readFileSync(join(HERE, 'publisher.mjs'), 'utf8')
+  assert.ok(!src.includes("'--seq'") && !src.includes("'--prev'"), 'PIN: no seq/prev overrides exist')
+
+  // 7b7f878e ordering pins: motion check before the first POST; re-walk + retarget before the REF POST
+  const iS2 = src.indexOf('const s2 = await walkSnapshot')
+  const iS3 = src.indexOf('const s3 = await walkSnapshot')
+  const iPost = src.indexOf('await broadcastOne(hex, bridges)')
+  assert.ok(iS2 > 0 && iS3 > iS2 && iPost > iS3, 'PIN: snapshot#2 (pre-first-POST) and snapshot#3 (pre-REF) both precede the POST in the loop')
+  assert.ok(src.includes('SUPERSEDED(retarget)') && src.includes('CHAIN_MOVED'), 'PIN: retarget-or-refuse exists, stranded data reported honestly')
+  assert.ok(src.includes('FUNDING_NOT_OURS'), 'PIN: continue-broadcast verifies the funding pays the signing key')
 })

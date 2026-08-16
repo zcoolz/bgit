@@ -63,3 +63,39 @@ domain check is claim-time evidence, not reader-verifiable), any key can claim t
 and thereby stage a same-block race or positional dependency — so against an INDEX-LESS source,
 a determined adversary can force `AMBIGUOUS_MINED_ORDER`. That is the ruled trade-off: the cure
 is a source with block data (the refusal names it), never a source-order guess.
+
+---
+
+## THE TOOLING TRIALS — claim verb + publisher `--continue` (2026-08-16, two rounds each)
+
+*The same discipline applied to the tools that exercise the law. Both were designed on paper,
+adversarially reviewed BEFORE code by the same reviewer lineage (OpenAI Codex, crypto seat)
+that tried the wire format, built with every finding folded, and approved on a second round
+against the finished code and gates. No finding was rebutted.*
+
+**`claim.mjs` — round one (BUILD-WITH-CHANGES):** the `.well-known` evidence must be FETCHED
+and receipted by the verb itself — twice, the second immediately before broadcast — never
+asserted by a flag, with no production bypass (the offline fixture seam has no broadcast path
+at all). Already-claimed detection must read the resolved authority timeline, not raw 0x06
+records, because stale or repeated attestations are not grants. `target_ref` and claim state
+must derive from ONE immutable walk snapshot, re-walked immediately before broadcast, refusing
+on any motion. Fee math must run on the actual single-input transaction, and the funding
+outpoint must provably pay the signing key. **Round two: APPROVED.** Gates: a claim built
+through the verb flips the real reader to the maintainer chain, with an inverted-mined-order
+red control proving the mined order — not array order — decides; refusal battery; source pins;
+a deliberate mutation (bite) test proving the suite catches a neutered refusal.
+
+**`publisher.mjs --continue` — round one (BUILD-WITH-CHANGES):** one shared chain-walker for
+reader, claim, and continue, with tip role and grant provenance bound into the snapshot digest
+so authority changes count as motion. Continuation authority (genesis key or accepted
+claimant) is checked before any satoshi moves. Claimant refs are FORCED to `role:
+"maintainer"`, and `claim_how` is emitted only on unsigned mirrors — a claimed repo must not
+advertise an invitation already exercised. The required finding: in a multi-transaction
+publish, the tip can move WHILE parts are broadcasting, stranding the final ref manifest as a
+permanent fork loser after the sats are spent — so the broadcast path walks the chain again
+immediately before the ref's POST and either lawfully re-derives it against the new mined tip
+(with explicit superseded/pending accounting) or refuses, reporting already-posted data
+honestly as reusable strands. **Round two: APPROVED.** Gates: genesis and claimant
+continuations executed end-to-end through the real reader; unauthorized-key refusal proven
+pre-spend; ordering and retarget invariants source-pinned; an UNAUTHORIZED_KEY bite proving
+test sensitivity; the full prior vector suite untouched.
