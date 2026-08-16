@@ -28,7 +28,7 @@
 //
 // Endpoints are ALWAYS explicit (house law: no default endpoints anywhere in these tools).
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync } from 'node:fs'
 import { resolve, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import {
@@ -314,7 +314,9 @@ function parseArgs (argv) {
   return o
 }
 
-const isMain = process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url
+const isMain = (() => {
+  try { return process.argv[1] && pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url } catch { return false }
+})()
 if (isMain) {
   const o = parseArgs(process.argv)
   const run = o.confirm ? runClaimConfirm(o) : runClaim(o)
