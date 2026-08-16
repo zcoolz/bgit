@@ -513,13 +513,16 @@ export async function runPublisher (opts) {
   lines.push('=== bgit publish plan (DRY RUN' + (opts.broadcast ? ' → BROADCAST' : '') + ') ===')
   lines.push(`spec:               ${plan.spec}`)
   lines.push(`repo:               ${plan.repo}`)
-  lines.push(`repo_id (fund me):  ${plan.repo_id}`)
+  lines.push(`repo_id:            ${plan.repo_id}`)
+  // the funding address is the SIGNING key's, which is NOT the repo address when a claimant
+  // continues someone else's chain — printing one label for both would misdirect real money
+  lines.push(`fund THIS address:  ${plan.fund_address}${plan.fund_address === plan.repo_id ? '' : '  (the signing key, not the repo)'}`)
   lines.push(`bundle:             ${plan.bundle}`)
   lines.push(`artifact bytes:     ${plan.artifact_bytes.toLocaleString('en-US')}`)
   lines.push(`artifact sha256:    ${plan.artifact_sha256}`)
   lines.push(`bundle_refs_sha256: ${plan.bundle_refs_sha256}`)
   lines.push(`parts:              ${plan.parts} × ≤${partBytes.toLocaleString('en-US')} bytes`)
-  lines.push(`transactions:       ${plan.tx_count} (${plan.parts} PART + 1 ARTIFACT MANIFEST + 1 REF MANIFEST seq=1)`)
+  lines.push(`transactions:       ${plan.tx_count} (${plan.parts} PART + 1 ARTIFACT MANIFEST + 1 REF MANIFEST seq=${cont ? cont.seq : 1}${cont ? `, role ${cont.role}, continuing ${cont.prevRef.slice(0, 12)}…` : ''})`)
   lines.push(`fee rate:           ${FEE_RATE_SAT_PER_KB} sat/KB`)
   lines.push(`total fee:          ${plan.total_fee_sats.toLocaleString('en-US')} sats`)
   lines.push(`dust (${DUST_SATS}/tx):        ${plan.dust_sats_total.toLocaleString('en-US')} sats`)
@@ -656,8 +659,16 @@ export async function runConfirm (opts) {
       const res = await fetch(url, { signal: AbortSignal.timeout(30_000) })
       if (res.ok) {
         const s = await res.json()
-        const h = s.blockHeight === undefined ? null : s.blockHeight
-        if (h !== null && h > 0) { verdict = `MINED@${h}`; t.status = 'ACCEPTED'; t.blockHeight = h; mined++ } else if (s.inMempool || s.exists) { verdict = 'PENDING(mempool)'; pending++ } else { verdict = 'NOT_SEEN'; unknown++ }
+        // Height field spellings differ per source and NONE of them are wrong: WhatsOnChain
+        // says `blockheight`, our own bridge says `height`, others say `blockHeight`. Reading
+        // only one spelling made this pass report NOT_SEEN for demonstrably mined transactions
+        // (caught 2026-08-16 on the randomx/supercop publishes) — a verifier that cannot
+        // recognise success is not a verifier. Unmined sources signal with 0, -1, or null;
+        // only a positive integer is a burial.
+        const raw = [s.blockHeight, s.blockheight, s.block_height, s.height]
+          .find((v) => typeof v === 'number' && Number.isFinite(v))
+        const h = typeof raw === 'number' && raw > 0 ? raw : null
+        if (h !== null) { verdict = `MINED@${h}`; t.status = 'ACCEPTED'; t.blockHeight = h; mined++ } else if (s.inMempool || s.exists || s.confirmations === 0 || raw === -1 || raw === 0) { verdict = 'PENDING(mempool)'; pending++ } else { verdict = 'NOT_SEEN'; unknown++ }
       } else unknown++
     } catch { unknown++ }
     console.log(`${verdict.padEnd(16)} ${t.txid}  ${t.role}`)
