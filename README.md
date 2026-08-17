@@ -210,6 +210,13 @@ as a spec:
 - **Submodules are separate repositories.** A repository's bundle contains its own history, not
   the histories of code it references. Mirroring a project's submodules is a separate act, and
   they are absent unless separately mirrored.
+- **`reader.mjs` here is the only known implementation, and that is a real dependency on us.**
+  The format is specified so it does not have to stay that way — §6 of [SPEC.md](SPEC.md) is
+  normative and this reader was deliberately written from the spec alone as an audit of it — but
+  until a second implementation exists, "anyone can rebuild it" means "anyone can run our code."
+  Those are not the same claim and we are not going to blur them. If you want to close this,
+  [IMPLEMENTERS.md](IMPLEMENTERS.md) is a guide to building one, including the traps that cost us
+  time and the three published repositories to validate against.
 - No shallow clones, no LFS-scale binaries, no issue tracker, no pull requests. This is the
   layer designed to stay reconstructable while an archival copy and a serving source exist, not
   the social layer. Bring your own social layer.
