@@ -18,6 +18,8 @@ You are done when your implementation, given only a repo address and public chai
 
 Not "close." Byte-identical. There is no partial credit and there shouldn't be.
 
+**Why this is the test and not the vectors.** A reasonable question about any conformance suite is where its expected answers come from. If they were produced by the reference implementation, then a second reader passing them proves conformance to *that implementation*, not to the thing it is supposed to read — the suite quietly inherits the exact property this guide exists to avoid. So here is the honest hierarchy of evidence, weakest to strongest. Some of the positive vectors are our publisher building a record and our reader accepting it; to that exact extent they measure agreement with us, not independent correctness, and you should treat them as smoke, not proof. The rejection vectors are stronger, because they encode *spec rules* — a high-S signature, a duplicate JSON key, bytes after the signature — each refused because [SPEC.md](SPEC.md) says refuse, checkable against the spec text without ever running our code. But the real oracle is neither: it is `git clone`. A bundle that clones into real Monero, 13,241 commits and all, has passed against Monero's own tooling, which has no stake in agreeing with us. That is the one check in the whole loop that cannot wear a second hat, because Monero wrote it, not us. Anchor your confidence there.
+
 **Start small.** These are the three published repositories in increasing order of difficulty:
 
 | Target | Size | repo_id | Bundle SHA-256 |
@@ -46,7 +48,7 @@ You need three things from the outside world, and the spec is deliberately agnos
 
 **Not every public API gives you all three.** Pick a source that supplies confirmed history, raw hex, *and* ordering metadata, and verify it does before you build on it. We do not want you using our infrastructure — the point of a second reader is that it does not depend on us. Our own independent reconstruction was done through third-party endpoints for exactly that reason, on a machine that had never held this code.
 
-**Test vectors** are in [`bgit-vectors.test.mjs`](bgit-vectors.test.mjs). Thirty of them, covering every rejection class, fork races at every height, claim replay, and malformed input. You do not need to use our test harness — the vectors themselves are the value, and they encode the rules that are easy to get wrong.
+**Test vectors** are in [`bgit-vectors.test.mjs`](bgit-vectors.test.mjs). Thirty of them, covering every rejection class, fork races at every height, claim replay, and malformed input. You do not need to use our test harness — the vectors themselves are the value, and they encode the rules that are easy to get wrong. Read them by provenance, per the hierarchy above: the rejection vectors encode spec rules and are independently checkable against [SPEC.md](SPEC.md); the positive signature round-trips only prove agreement with our implementation; the end-to-end vector (publisher to reader to byte-identical bundle to `git clone`) is the one that anchors to Monero's own tooling. Passing all thirty is necessary and not sufficient — the clone is what counts.
 
 ---
 
