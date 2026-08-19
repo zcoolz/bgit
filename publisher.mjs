@@ -22,6 +22,7 @@ import { createRequire } from 'node:module'
 import { createHash } from 'node:crypto'
 import {
   readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, mkdtempSync, statSync,
+  realpathSync,
 } from 'node:fs'
 import { join, resolve, dirname, isAbsolute } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -718,7 +719,7 @@ function parseArgs (argv) {
 }
 
 const isMain = (() => {
-  try { return process.argv[1] && pathToFileURL(resolve(process.argv[1])).href.toLowerCase() === import.meta.url.toLowerCase() } catch { return false }
+  try { return process.argv[1] && pathToFileURL(realpathSync(process.argv[1])).href.toLowerCase() === import.meta.url.toLowerCase() } catch { return false }
 })()
 
 if (isMain) {
