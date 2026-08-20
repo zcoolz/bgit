@@ -279,9 +279,11 @@ as a spec:
   wrote the code, that the bundle matches its `repo` label (that field is self-asserted), or that no
   one holds an earlier proof of the same bytes — for already-public code anyone can fingerprint the
   same bytes and anchor them earlier, so it shows "existed by then," not "existed first," and is
-  strongest for bytes that were never public before you anchored them. And no proof-only publish has
-  been broadcast to chain yet (the kind shipped 2026-08-19), so the cost figures above are the
-  dry-run plan, not a measured receipt like Monero's.
+  strongest for bytes that were never public before you anchored them. The first proof-only publish
+  is now on chain: bgit notarized its own history (116,813 bytes) in block 963152 for a measured
+  239 satoshis, without storing a byte — repo_id `1EvfcLh6sP4UFqB4H5W2BFwgeaLhkJtTnR`, ref manifest
+  `a24763f359d9a20990242d80ac9a826c2d031845e2568657d8a26d4759f1c4ff`, artifact manifest
+  `c6e870515b76479f37b66a0662f4eacae7c3b0b7f67dde32c67ad651732a88c8`.
 - **Signatures cannot prove freshness.** A frozen ref chain is undetectable from one source, and
   neither is withholding — a single source cannot prove absence. Read from several.
 - **"Forever" is bounded by the primitives.** Integrity and authenticity here rest on SHA-256 and
