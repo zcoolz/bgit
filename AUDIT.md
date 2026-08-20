@@ -99,3 +99,53 @@ honestly as reusable strands. **Round two: APPROVED.** Gates: genesis and claima
 continuations executed end-to-end through the real reader; unauthorized-key refusal proven
 pre-spend; ordering and retarget invariants source-pinned; an UNAUTHORIZED_KEY bite proving
 test sensitivity; the full prior vector suite untouched.
+
+## THE PROOF-ONLY TRIAL — §11 v1.4 amendment (2026-08-19)
+
+*The notarization kind (§11) was tried the same way the wire format and the tools were: an
+adversarial design pass before code (Anthropic Claude), then two rounds on the built code by the
+OpenAI Codex crypto seat over the same cross-vendor review wire. Three defects and one
+compatibility caveat, every one folded, none rebutted, each pinned to a red-controlled vector that
+breaks the guard and confirms it bites. THE ONE LAW under test: existence (proof-only) and
+permanence (a full bundle) must never blur, and every ambiguity resolves toward permanence.*
+
+**FIX A — the recover walk must key off the CLASSIFIER, not the ref's self-declared flag.** §11.6
+reports the last recoverable full bundle beneath a proof-only tip. The first build read each
+ancestor's `stores_bytes` — but an ancestor ref is never cross-checked during resolution, so a
+proof-only ancestor that omitted the flag (which reads as permanence) could masquerade as
+recoverable. The walk now keys off the artifact-manifest classifier verdict (`kind === "git-bundle"`),
+never the ref flag. Pinned by test 36; the red control at test 33 breaks the storage cross-check and
+proves a proof-only artifact would otherwise pass under a permanence-claiming ref.
+
+**FIX B — VERIFY must never claim permanence off a fingerprint.** A fingerprint or signature match
+against no bytes proves nothing, so the VERIFY verb now REQUIRES the caller's local bundle, runs
+`git bundle verify`, and reports `VERIFIED_LOCAL_BYTES_NOT_STORED_ON_CHAIN` — never bare chain
+reconstructability, and it reports `chain_storage=declared-unverified` when a git-bundle chain is
+missing a part rather than claiming permanence off the manifest. Pinned by test 37; the red control
+at test 41 neuters the mismatch throw and proves a non-matching bundle would otherwise be reported
+verified.
+
+**FIX C — the mid-publish retarget must re-apply the downgrade consent gate.** Continuing a
+bytes-storing chain with a proof-only publish is a permanence→existence downgrade, gated at plan
+time (`DOWNGRADE_REFUSED`). If the tip moved WHILE the publish was broadcasting and the ref was
+re-derived against the new tip, the consent gate was not re-checked — so the gate now re-applies on
+the retarget path, against the moved tip, before the rebuild. Pinned by test 39; the red control at
+test 35 neuters the gate and proves the downgrade would otherwise proceed silently.
+
+**The read-old-forever COMPATIBILITY CAVEAT (folded, not a defect).** A `kind`-absent record
+carrying a valid non-empty `parts` array must still classify as a git-bundle — the original reader
+ignored `kind` entirely. Codex confirmed the classifier's absent-kind branch must REQUIRE real parts
+(so no proof-only can reach it) and that an absent-kind-with-empty-or-missing-parts record falls to
+ordinary §3 parts validation (`FIELD_INVALID:parts`) or the unknown-kind refusal, both fail-closed.
+Pinned by test 38; the red control at test 32 neuters the fail-closed default and proves an unknown
+kind would otherwise be accepted as a git-bundle.
+
+**Round-two residual — recover HONESTY.** A git-bundle manifest can be mined while a part tx never
+lands, so "the manifest declares a full bundle" and "its bytes are reachable from this source" are
+separate facts. The recover report names both separately (`parts_present_in_walk`), so a git-bundle
+ancestor with a missing part is named as the last full-bundle state with `parts_present_in_walk=false`
+— never a flat recoverable claim. Pinned by test 40; test 34 is the reconstruction-seam red control.
+
+The nineteen §11 vectors (tests 24–41, plus 24b) pin all of it, including five red controls (32–35
+and 41) that each break a guard and confirm it bites, and the FIX A–E confirmations (36–40). They
+ride the same suite as the core format: `npm test`, 49 total.

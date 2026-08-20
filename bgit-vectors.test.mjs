@@ -1170,3 +1170,404 @@ test('23. CONTINUE G3/G4: unmined-tip walk refuses; seq/prev underivable by flag
   assert.ok(src.includes('SUPERSEDED(retarget)') && src.includes('CHAIN_MOVED'), 'PIN: retarget-or-refuse exists, stranded data reported honestly')
   assert.ok(src.includes('FUNDING_NOT_OURS'), 'PIN: continue-broadcast verifies the funding pays the signing key')
 })
+
+// ===========================================================================
+// PROOF-ONLY (the notarization kind) — the razor between EXISTENCE and PERMANENCE
+// ===========================================================================
+// A raw artifact tx from an ARBITRARY JSON body — proof-only tests must craft bodies the enforced
+// builder refuses to construct (unknown kind, absent kind, smuggled parts).
+function artifactTxFromBody (bodyObj, { key = repoKey, paysRepo = true } = {}) {
+  const body = Buffer.from(JSON.stringify(bodyObj), 'utf8')
+  const rec = pub.signedRecord(pub.TYPE_ARTIFACT, body, key)
+  const outs = [{ sats: 0, script: pub.recordScript(rec) }]
+  if (paysRepo) outs.push({ sats: 10, script: repoScript })
+  const raw = rawTx(outs)
+  return { raw, txid: txidOf(raw) }
+}
+
+test('24. PROOF-ONLY classifier (HOLE 1): kind is a CLOSED enum — proof-only accepted (parts ABSENT), git-bundle accepted, every other kind REFUSED', () => {
+  const A1 = FAKE64(1); const D1 = FAKE64(2)
+
+  // (a) a well-formed proof-only artifact (parts key ABSENT) is collected, kind threaded
+  const proofBody = JSON.parse(pub.buildArtifactBody({
+    mode: 'proof', repo: 't/t', artifactSha256: A1, artifactBytes: 269600118,
+    bundleRefsSha256: D1, label: 'PROOF ONLY', publishedAt: '2026-08-19T00:00:00Z',
+  }).toString('utf8'))
+  assert.strictEqual(proofBody.kind, 'proof-only')
+  assert.ok(!('parts' in proofBody), 'the builder OMITS the parts key for proof-only (never [])')
+  const c1 = rdr.collectRecords(asWalk([artifactTxFromBody(proofBody)]), repoAddr)
+  assert.strictEqual(c1.artifacts.size, 1, 'proof-only artifact is collected')
+  assert.strictEqual([...c1.artifacts.values()][0].kind, 'proof-only', 'the classifier threads kind=proof-only downstream')
+
+  // (b) control: a git-bundle artifact still classifies as git-bundle (the live-repo path, unchanged)
+  const fullBody = JSON.parse(pub.buildArtifactBody({
+    repo: 't/t', artifactSha256: A1, artifactBytes: 10,
+    parts: [{ txid: A1, sha256: A1, bytes: 10 }], bundleRefsSha256: D1, label: 'x', publishedAt: '2026-08-19T00:00:00Z',
+  }).toString('utf8'))
+  const c2 = rdr.collectRecords(asWalk([artifactTxFromBody(fullBody)]), repoAddr)
+  assert.strictEqual([...c2.artifacts.values()][0].kind, 'git-bundle')
+
+  // (c) a reserved-future or unknown kind is REFUSED, never guessed (the read-old-forever floor)
+  for (const badKind of ['git-bundle-incremental', 'proof_only', 'PROOF-ONLY', '', 42]) {
+    const c = rdr.collectRecords(asWalk([artifactTxFromBody({ ...proofBody, kind: badKind })]), repoAddr)
+    assert.strictEqual(c.artifacts.size, 0, `kind ${JSON.stringify(badKind)} not collected`)
+    assert.strictEqual(c.rejected.find((r) => r.type === 0x02)?.code, 'UNSUPPORTED_ARTIFACT_KIND', `kind ${JSON.stringify(badKind)} → UNSUPPORTED_ARTIFACT_KIND`)
+  }
+
+  // (d) kind absent entirely → refused
+  const noKind = { ...proofBody }; delete noKind.kind
+  assert.strictEqual(rdr.collectRecords(asWalk([artifactTxFromBody(noKind)]), repoAddr).rejected.find((r) => r.type === 0x02)?.code, 'UNSUPPORTED_ARTIFACT_KIND', 'kind absent → refused')
+
+  // (e) proof-only that smuggles a parts key (incl. the "[] restores to 0 bytes" trap) → refused;
+  //     the key must be ABSENT, not null, not []
+  for (const parts of [[], null, [{ txid: A1, sha256: A1, bytes: 10 }]]) {
+    assert.strictEqual(rdr.collectRecords(asWalk([artifactTxFromBody({ ...proofBody, parts })]), repoAddr).rejected.find((r) => r.type === 0x02)?.code, 'PROOF_ONLY_HAS_PARTS', `proof-only + parts=${JSON.stringify(parts)} → PROOF_ONLY_HAS_PARTS`)
+  }
+})
+
+test('24b. PROOF-ONLY builder: mode is a closed enum — unknown mode throws, git-bundle asserts parts, proof mode drops any parts input', () => {
+  const A1 = FAKE64(1); const D1 = FAKE64(2)
+  assert.throws(() => pub.buildArtifactBody({ mode: 'sideways', repo: 't', artifactSha256: A1, artifactBytes: 1, bundleRefsSha256: D1, label: 'x', publishedAt: 'z' }), /unknown mode/, 'unknown mode refuses at build time')
+  assert.throws(() => pub.buildArtifactBody({ mode: 'full', repo: 't', artifactSha256: A1, artifactBytes: 1, parts: [], bundleRefsSha256: D1, label: 'x', publishedAt: 'z' }), /git-bundle requires non-empty parts/, 'git-bundle with empty parts refuses at build time (the assert)')
+  const pb = JSON.parse(pub.buildArtifactBody({ mode: 'proof', repo: 't', artifactSha256: A1, artifactBytes: 1, parts: [{ txid: A1, sha256: A1, bytes: 1 }], bundleRefsSha256: D1, label: 'x', publishedAt: 'z' }).toString('utf8'))
+  assert.ok(!('parts' in pb), 'proof mode drops any parts input — the mode is the authority, not the caller-supplied parts')
+})
+
+// a raw ref tx from an already-built ref body (proof-only tests craft refs with stores_bytes)
+function refTxFromBody (body, { key = repoKey, paysRepo = true } = {}) {
+  const rec = pub.signedRecord(pub.TYPE_REF, body, key)
+  const outs = [{ sats: 0, script: pub.recordScript(rec) }]
+  if (paysRepo) outs.push({ sats: 10, script: repoScript })
+  const raw = rawTx(outs)
+  return { raw, txid: txidOf(raw) }
+}
+
+test('25. PROOF-ONLY ratchet (HOLE 3): stores_bytes is validated — false accepted, ABSENT = legacy permanence, non-boolean REFUSED', () => {
+  const A1 = FAKE64(1); const D1 = FAKE64(2)
+  const cF = rdr.collectRecords(asWalk([refTxFromBody(pub.buildRefBody({ repoId: repoAddr, seq: 1, prev: null, artifactTxid: A1, refsSha256: D1, storesBytes: false }))]), repoAddr)
+  assert.strictEqual(cF.refs.length, 1); assert.strictEqual(cF.refs[0].storesBytes, false, 'stores_bytes:false is carried onto the ref record')
+  const cA = rdr.collectRecords(asWalk([refTx({ seq: 1, prev: null, artifact: A1, refsSha: D1 })]), repoAddr)
+  assert.strictEqual(cA.refs[0].storesBytes, true, 'ABSENT stores_bytes reads as permanence (read-old-forever)')
+  const cB = rdr.collectRecords(asWalk([refTxFromBody(pub.buildRefBody({ repoId: repoAddr, seq: 1, prev: null, artifactTxid: A1, refsSha256: D1, storesBytes: 'yes' }))]), repoAddr)
+  assert.strictEqual(cB.refs.length, 0)
+  assert.strictEqual(cB.rejected.find((r) => r.type === 0x03)?.code, 'FIELD_INVALID:stores_bytes', 'a non-boolean stores_bytes is rejected')
+})
+
+test('26. PROOF-ONLY read + RECOVER (HOLE 2/3): a proof-only tip over a git-bundle genesis reads stored:false, writes NO bundle, and surfaces the last recoverable full bundle', async () => {
+  const fx = realFixture()
+  const genesisArt = fx.chain.plan.artifact_manifest_txid
+  const proofSha = FAKE64(200); const proofRefs = FAKE64(201)
+  const proofArt = artifactTxFromBody(JSON.parse(pub.buildArtifactBody({
+    mode: 'proof', repo: 'test/real', artifactSha256: proofSha, artifactBytes: 269600118,
+    bundleRefsSha256: proofRefs, label: 'PROOF ONLY', publishedAt: '2026-08-19T00:00:00Z',
+  }).toString('utf8')))
+  const proofRef = refTxFromBody(pub.buildRefBody({ repoId: repoAddr, seq: 2, prev: fx.chain.plan.ref_manifest_txid, artifactTxid: proofArt.txid, refsSha256: proofRefs, storesBytes: false }))
+
+  const merged = join(ROOT, 'proof-continuation')
+  const baseChain = cloneChainDir(fx.outDir, merged)
+  writeFileSync(join(merged, 'proof-art.hex'), proofArt.raw.toString('hex'))
+  writeFileSync(join(merged, 'proof-ref.hex'), proofRef.raw.toString('hex'))
+  baseChain.entries.push({ txid: proofArt.txid, file: 'proof-art.hex' }, { txid: proofRef.txid, file: 'proof-ref.hex' })
+  writeFileSync(join(merged, 'chain.json'), JSON.stringify(baseChain, null, 2))
+
+  const outPath = join(ROOT, 'proof-out.bundle')
+  const rep = await rdr.runReader({ repoId: repoAddr, localIn: merged, out: outPath, quiet: true })
+  assert.strictEqual(rep.stored, false, 'stored:false — the discriminator every consumer keys off')
+  assert.strictEqual(rep.kind, 'proof-only')
+  assert.strictEqual(rep.tip.seq, 2, 'the proof-only ref is the tip')
+  assert.strictEqual(rep.out, null, 'no output path')
+  assert.ok(!existsSync(outPath), 'proof-only NEVER writes a bundle — no faked reconstruction, not even a partial')
+  assert.strictEqual(rep.commitment.artifact_sha256, proofSha, 'the commitment is surfaced')
+  assert.ok(rep.latest_recoverable_bundle, 'the recover walk found the last permanent state')
+  assert.strictEqual(rep.latest_recoverable_bundle.seq, 1)
+  assert.strictEqual(rep.latest_recoverable_bundle.artifact_txid, genesisArt, 'recover points at the genesis git-bundle artifact')
+})
+
+test('27. PROOF-ONLY ratchet (HOLE 3): a proof-only artifact cannot masquerade as permanence, and a git-bundle cannot be mislabeled proof-only — both REFUSE', async () => {
+  const fx = realFixture()
+  const proofSha = FAKE64(210); const proofRefs = FAKE64(211)
+  const proofArt = artifactTxFromBody(JSON.parse(pub.buildArtifactBody({ mode: 'proof', repo: 'test/real', artifactSha256: proofSha, artifactBytes: 100, bundleRefsSha256: proofRefs, label: 'x', publishedAt: 'z' }).toString('utf8')))
+
+  // (a) proof-only artifact under a ref that OMITS stores_bytes (looks legacy=permanent) → refuse
+  const badRef = refTxFromBody(pub.buildRefBody({ repoId: repoAddr, seq: 2, prev: fx.chain.plan.ref_manifest_txid, artifactTxid: proofArt.txid, refsSha256: proofRefs }))
+  const m1 = join(ROOT, 'proof-masquerade')
+  const c1 = cloneChainDir(fx.outDir, m1)
+  writeFileSync(join(m1, 'p-art.hex'), proofArt.raw.toString('hex'))
+  writeFileSync(join(m1, 'p-ref.hex'), badRef.raw.toString('hex'))
+  c1.entries.push({ txid: proofArt.txid, file: 'p-art.hex' }, { txid: badRef.txid, file: 'p-ref.hex' })
+  writeFileSync(join(m1, 'chain.json'), JSON.stringify(c1, null, 2))
+  await assert.rejects(() => rdr.runReader({ repoId: repoAddr, localIn: m1, out: join(ROOT, 'x1.bundle'), quiet: true }), /STORAGE_KIND_MISMATCH/)
+
+  // (b) git-bundle artifact under a stores_bytes:false ref (mislabeled) → refuse
+  const badRef2 = refTxFromBody(pub.buildRefBody({ repoId: repoAddr, seq: 2, prev: fx.chain.plan.ref_manifest_txid, artifactTxid: fx.chain.plan.artifact_manifest_txid, refsSha256: fx.chain.plan.bundle_refs_sha256, storesBytes: false }))
+  const m2 = join(ROOT, 'full-mislabeled')
+  const c2 = cloneChainDir(fx.outDir, m2)
+  writeFileSync(join(m2, 'b-ref.hex'), badRef2.raw.toString('hex'))
+  c2.entries.push({ txid: badRef2.txid, file: 'b-ref.hex' })
+  writeFileSync(join(m2, 'chain.json'), JSON.stringify(c2, null, 2))
+  await assert.rejects(() => rdr.runReader({ repoId: repoAddr, localIn: m2, out: join(ROOT, 'x2.bundle'), quiet: true }), /STORAGE_KIND_MISMATCH/)
+})
+
+test('28. PROOF-ONLY downgrade refusal (HOLE 3 PREVENT): --continue --proof-only over a git-bundle tip is REFUSED without --downgrade-to-proof-only', () => {
+  const fx = realFixture()
+  const repo2 = makeRepoBundle({ commits: 2, filler: 100 })
+  const r = runCli(join(HERE, 'publisher.mjs'), [
+    '--bundle', repo2.bundlePath, '--repo', 'test/real', '--key', repoKey.toWif(),
+    '--part-bytes', '700', '--local-out', join(ROOT, 'downgrade-refused'), '--continue', '--chain-in', fx.outDir, '--proof-only',
+  ])
+  assert.notStrictEqual(r.status, 0, 'the downgrade is refused (non-zero exit)')
+  assert.ok(r.stderr.includes('DOWNGRADE_REFUSED'), `stderr names the refusal: ${r.stderr}`)
+})
+
+test('29. VERIFY verb (git-bundle): a matching local bundle → VERIFIED_LOCAL_BYTES_NOT_STORED_ON_CHAIN; a different bundle → VERIFY_MISMATCH; no --bundle → USAGE (never verified off nothing)', async () => {
+  const fx = realFixture()
+  const rep = await rdr.runVerify({ repoId: repoAddr, localIn: fx.outDir, bundle: fx.repo.bundlePath, quiet: true })
+  assert.strictEqual(rep.verified, true)
+  assert.strictEqual(rep.code, 'VERIFIED_LOCAL_BYTES_NOT_STORED_ON_CHAIN')
+  assert.strictEqual(rep.kind, 'git-bundle')
+  assert.strictEqual(rep.chain_storage, 'declared-unverified', 'VERIFY declares the manifest kind but does NOT verify chain storage')
+  assert.ok(!('stored' in rep), 'VERIFY never emits a bare stored:true — the reader owns that verified claim')
+  assert.strictEqual(rep.local.artifact_sha256, fx.bundleSha)
+  const other = makeRepoBundle({ commits: 2, filler: 50 })
+  await assert.rejects(() => rdr.runVerify({ repoId: repoAddr, localIn: fx.outDir, bundle: other.bundlePath, quiet: true }), /VERIFY_MISMATCH/, 'a different bundle does not match the commitment')
+  await assert.rejects(() => rdr.runVerify({ repoId: repoAddr, localIn: fx.outDir, quiet: true }), /--verify requires --bundle/, 'verification REQUIRES the bytes — never "verified" off a fingerprint alone')
+})
+
+test('30. VERIFY verb (proof-only): the REAL bundle behind a proof-only commitment verifies; the reader on the same chain refuses to reconstruct', async () => {
+  const fx = realFixture()
+  const repoP = makeRepoBundle({ commits: 3, filler: 200 })
+  const realBuf = readFileSync(repoP.bundlePath)
+  const realSha = sha256hex(realBuf)
+  const realRefs = pub.bundleRefsSha256(repoP.bundlePath)
+  const proofArt = artifactTxFromBody(JSON.parse(pub.buildArtifactBody({
+    mode: 'proof', repo: 'test/real', artifactSha256: realSha, artifactBytes: realBuf.length,
+    bundleRefsSha256: realRefs, label: 'PROOF ONLY', publishedAt: '2026-08-19T00:00:00Z',
+  }).toString('utf8')))
+  const proofRef = refTxFromBody(pub.buildRefBody({ repoId: repoAddr, seq: 2, prev: fx.chain.plan.ref_manifest_txid, artifactTxid: proofArt.txid, refsSha256: realRefs, storesBytes: false }))
+  const merged = join(ROOT, 'proof-verify')
+  const baseChain = cloneChainDir(fx.outDir, merged)
+  writeFileSync(join(merged, 'pv-art.hex'), proofArt.raw.toString('hex'))
+  writeFileSync(join(merged, 'pv-ref.hex'), proofRef.raw.toString('hex'))
+  baseChain.entries.push({ txid: proofArt.txid, file: 'pv-art.hex' }, { txid: proofRef.txid, file: 'pv-ref.hex' })
+  writeFileSync(join(merged, 'chain.json'), JSON.stringify(baseChain, null, 2))
+
+  const rep = await rdr.runVerify({ repoId: repoAddr, localIn: merged, bundle: repoP.bundlePath, quiet: true })
+  assert.strictEqual(rep.verified, true)
+  assert.strictEqual(rep.kind, 'proof-only')
+  assert.strictEqual(rep.chain_storage, 'none', 'proof-only: the chain holds no bytes (authoritative from kind)')
+  assert.strictEqual(rep.local.artifact_sha256, realSha)
+  assert.strictEqual(rep.tip.seq, 2)
+  const rd = await rdr.runReader({ repoId: repoAddr, localIn: merged, out: join(ROOT, 'pv-out.bundle'), quiet: true })
+  assert.strictEqual(rd.stored, false)
+  assert.ok(!existsSync(join(ROOT, 'pv-out.bundle')), 'proof-only reader writes no bundle even when the real bytes exist off-chain')
+})
+
+test('31. PROOF-ONLY publish path (EXECUTION): the publisher builds a 2-tx proof-only fixture; the reader reads it stored:false + writes NO bundle; VERIFY on the same bundle matches', async () => {
+  const repoP = makeRepoBundle({ commits: 3, filler: 400 })
+  const realSha = sha256hex(readFileSync(repoP.bundlePath))
+  const outDir = join(ROOT, 'proof-publish')
+  const r = runCli(join(HERE, 'publisher.mjs'), [
+    '--bundle', repoP.bundlePath, '--repo', 'test/proof', '--key', repoKey.toWif(),
+    '--local-out', outDir, '--proof-only',
+  ])
+  assert.strictEqual(r.status, 0, `proof-only publisher: ${r.stderr}`)
+  const chain = JSON.parse(readFileSync(join(outDir, 'chain.json'), 'utf8'))
+  assert.strictEqual(chain.plan.kind, 'proof-only')
+  assert.strictEqual(chain.plan.stores_bytes, false)
+  assert.strictEqual(chain.plan.parts, 0, 'no PART txs')
+  assert.strictEqual(chain.plan.tx_count, 2, 'exactly 1 ARTIFACT MANIFEST + 1 REF MANIFEST')
+  assert.ok(r.stdout.includes('PROOF ONLY'), 'the plan report says PROOF ONLY')
+
+  // the reader reads it as proof-only: stored:false, the on-chain commitment IS the real fingerprint, NO bundle written
+  const outPath = join(ROOT, 'proof-publish-out.bundle')
+  const rep = await rdr.runReader({ repoId: repoAddr, localIn: outDir, out: outPath, quiet: true })
+  assert.strictEqual(rep.stored, false)
+  assert.strictEqual(rep.kind, 'proof-only')
+  assert.strictEqual(rep.commitment.artifact_sha256, realSha, 'the on-chain commitment IS the real bundle fingerprint')
+  assert.ok(!existsSync(outPath), 'proof-only reader writes no bundle')
+
+  // and VERIFY the real bundle against this proof-only publish → verified end to end
+  const v = await rdr.runVerify({ repoId: repoAddr, localIn: outDir, bundle: repoP.bundlePath, quiet: true })
+  assert.strictEqual(v.verified, true)
+  assert.strictEqual(v.local.artifact_sha256, realSha)
+})
+
+// ===========================================================================
+// RED CONTROLS — each proof-only guard is BROKEN on purpose; the break must BITE.
+// makeBrokenCopy asserts the target is present + UNIQUE + actually replaced before the neutered
+// module is ever imported (feedback_a_red_control_must_verify_its_own_break_landed).
+// ===========================================================================
+
+test('32. RED (classifier default): neuter the fail-closed default → an unknown kind is silently accepted as git-bundle', async () => {
+  const brokenPath = makeBrokenCopy(join(HERE, 'reader.mjs'), "return { error: 'UNSUPPORTED_ARTIFACT_KIND' }", "return { kind: 'git-bundle' }")
+  const broken = await import(pathToFileURL(brokenPath).href)
+  const A1 = FAKE64(1); const D1 = FAKE64(2)
+  const body = JSON.parse(pub.buildArtifactBody({ mode: 'proof', repo: 't', artifactSha256: A1, artifactBytes: 1, bundleRefsSha256: D1, label: 'x', publishedAt: 'z' }).toString('utf8'))
+  const evil = artifactTxFromBody({ ...body, kind: 'git-bundle-incremental' })
+  assert.strictEqual(rdr.collectRecords(asWalk([evil]), repoAddr).artifacts.size, 0, 'the intact reader REFUSES an unknown kind')
+  assert.strictEqual(broken.collectRecords(asWalk([evil]), repoAddr).artifacts.size, 1, 'RED: the broken reader accepts a kind it does not implement, as git-bundle')
+})
+
+test('33. RED (storage cross-check): neuter the mismatch guard → a proof-only artifact masquerades under a permanence-claiming ref, no refusal', async () => {
+  const brokenPath = makeBrokenCopy(join(HERE, 'reader.mjs'), 'if (tipStores !== artifactStores) {', 'if (false) {')
+  const broken = await import(pathToFileURL(brokenPath).href)
+  const fx = realFixture()
+  const proofSha = FAKE64(220); const proofRefs = FAKE64(221)
+  const proofArt = artifactTxFromBody(JSON.parse(pub.buildArtifactBody({ mode: 'proof', repo: 'test/real', artifactSha256: proofSha, artifactBytes: 100, bundleRefsSha256: proofRefs, label: 'x', publishedAt: 'z' }).toString('utf8')))
+  const badRef = refTxFromBody(pub.buildRefBody({ repoId: repoAddr, seq: 2, prev: fx.chain.plan.ref_manifest_txid, artifactTxid: proofArt.txid, refsSha256: proofRefs })) // stores_bytes ABSENT → claims permanence
+  const m = join(ROOT, 'red-masquerade')
+  const c = cloneChainDir(fx.outDir, m)
+  writeFileSync(join(m, 'r-art.hex'), proofArt.raw.toString('hex'))
+  writeFileSync(join(m, 'r-ref.hex'), badRef.raw.toString('hex'))
+  c.entries.push({ txid: proofArt.txid, file: 'r-art.hex' }, { txid: badRef.txid, file: 'r-ref.hex' })
+  writeFileSync(join(m, 'chain.json'), JSON.stringify(c, null, 2))
+  await assert.rejects(() => rdr.runReader({ repoId: repoAddr, localIn: m, out: join(ROOT, 'ri.bundle'), quiet: true }), /STORAGE_KIND_MISMATCH/, 'the intact reader REFUSES the masquerade')
+  const rep = await broken.runReader({ repoId: repoAddr, localIn: m, out: join(ROOT, 'rb.bundle'), quiet: true })
+  assert.strictEqual(rep.stored, false, 'RED: the broken reader serves a read under a ref that claims permanence, without refusing')
+})
+
+test('34. RED (reconstruction seam): neuter the proof-only fork → the reader no longer returns the clean commitment (falls into reconstruction and errors)', async () => {
+  const brokenPath = makeBrokenCopy(join(HERE, 'reader.mjs'), "if (artifact.kind === 'proof-only') {", 'if (false) {')
+  const broken = await import(pathToFileURL(brokenPath).href)
+  const fx = realFixture()
+  const proofSha = FAKE64(230); const proofRefs = FAKE64(231)
+  const proofArt = artifactTxFromBody(JSON.parse(pub.buildArtifactBody({ mode: 'proof', repo: 'test/real', artifactSha256: proofSha, artifactBytes: 100, bundleRefsSha256: proofRefs, label: 'x', publishedAt: 'z' }).toString('utf8')))
+  const proofRef = refTxFromBody(pub.buildRefBody({ repoId: repoAddr, seq: 2, prev: fx.chain.plan.ref_manifest_txid, artifactTxid: proofArt.txid, refsSha256: proofRefs, storesBytes: false }))
+  const m = join(ROOT, 'red-reconstruct')
+  const c = cloneChainDir(fx.outDir, m)
+  writeFileSync(join(m, 'rr-art.hex'), proofArt.raw.toString('hex'))
+  writeFileSync(join(m, 'rr-ref.hex'), proofRef.raw.toString('hex'))
+  c.entries.push({ txid: proofArt.txid, file: 'rr-art.hex' }, { txid: proofRef.txid, file: 'rr-ref.hex' })
+  writeFileSync(join(m, 'chain.json'), JSON.stringify(c, null, 2))
+  const intactOut = join(ROOT, 'rr-intact.bundle')
+  const intact = await rdr.runReader({ repoId: repoAddr, localIn: m, out: intactOut, quiet: true })
+  assert.strictEqual(intact.stored, false, 'the intact reader cleanly returns the proof-only commitment')
+  assert.ok(!existsSync(intactOut), 'and writes no bundle')
+  const brokenOut = join(ROOT, 'rr-broken.bundle')
+  await assert.rejects(() => broken.runReader({ repoId: repoAddr, localIn: m, out: brokenOut, quiet: true }), 'RED: without the fork, a proof-only artifact falls into reconstruction and errors')
+  assert.ok(!existsSync(brokenOut), 'the atomic discipline still leaves no partial artifact — but the CLEAN read is gone')
+})
+
+test('35. RED (downgrade gate): neuter the --continue guard → a permanence→proof-only downgrade proceeds without refusal', () => {
+  const brokenPath = makeBrokenCopy(join(HERE, 'publisher.mjs'), 'if (opts.proofOnly && snap.tipStoresBytes && !opts.downgradeToProofOnly) {', 'if (false) {')
+  const fx = realFixture()
+  const repo2 = makeRepoBundle({ commits: 2, filler: 80 })
+  const args = ['--bundle', repo2.bundlePath, '--repo', 'test/real', '--key', repoKey.toWif(), '--part-bytes', '700', '--local-out', join(ROOT, 'red-downgrade'), '--continue', '--chain-in', fx.outDir, '--proof-only']
+  const intact = runCli(join(HERE, 'publisher.mjs'), args)
+  assert.ok(intact.stderr.includes('DOWNGRADE_REFUSED'), 'the intact publisher REFUSES the downgrade')
+  const broken = runCli(brokenPath, args)
+  assert.ok(!broken.stderr.includes('DOWNGRADE_REFUSED'), `RED: the broken publisher proceeds with the downgrade, no refusal: ${broken.stderr.slice(0, 200)}`)
+})
+
+// ===========================================================================
+// SYNTHESIS FIXES — adversarial review (fable-class workflow + Codex drift wire), each re-proven.
+// ===========================================================================
+
+test('36. FIX A (recover ancestor): the recover walk keys off the ARTIFACT kind, not the ref flag — a proof-only ancestor cannot masquerade as the last recoverable bundle; the real git-bundle below it is found', async () => {
+  const fx = realFixture()
+  const genesisArt = fx.chain.plan.artifact_manifest_txid // the REAL git-bundle at seq=1
+  // seq=2: a proof-only artifact under a ref that OMITS stores_bytes (reads permanence) — the poison
+  const p2 = artifactTxFromBody(JSON.parse(pub.buildArtifactBody({ mode: 'proof', repo: 'test/real', artifactSha256: FAKE64(300), artifactBytes: 269600118, bundleRefsSha256: FAKE64(301), label: 'x', publishedAt: 'z' }).toString('utf8')))
+  const r2 = refTxFromBody(pub.buildRefBody({ repoId: repoAddr, seq: 2, prev: fx.chain.plan.ref_manifest_txid, artifactTxid: p2.txid, refsSha256: FAKE64(301) })) // stores_bytes ABSENT
+  // seq=3: an honest proof-only tip
+  const p3 = artifactTxFromBody(JSON.parse(pub.buildArtifactBody({ mode: 'proof', repo: 'test/real', artifactSha256: FAKE64(310), artifactBytes: 100, bundleRefsSha256: FAKE64(311), label: 'x', publishedAt: 'z' }).toString('utf8')))
+  const r3 = refTxFromBody(pub.buildRefBody({ repoId: repoAddr, seq: 3, prev: r2.txid, artifactTxid: p3.txid, refsSha256: FAKE64(311), storesBytes: false }))
+  const m = join(ROOT, 'recover-ancestor')
+  const c = cloneChainDir(fx.outDir, m)
+  writeFileSync(join(m, 'ra-p2.hex'), p2.raw.toString('hex'))
+  writeFileSync(join(m, 'ra-r2.hex'), r2.raw.toString('hex'))
+  writeFileSync(join(m, 'ra-p3.hex'), p3.raw.toString('hex'))
+  writeFileSync(join(m, 'ra-r3.hex'), r3.raw.toString('hex'))
+  c.entries.push({ txid: p2.txid, file: 'ra-p2.hex' }, { txid: r2.txid, file: 'ra-r2.hex' }, { txid: p3.txid, file: 'ra-p3.hex' }, { txid: r3.txid, file: 'ra-r3.hex' })
+  writeFileSync(join(m, 'chain.json'), JSON.stringify(c, null, 2))
+
+  const rep = await rdr.runReader({ repoId: repoAddr, localIn: m, out: join(ROOT, 'ra.bundle'), quiet: true })
+  assert.strictEqual(rep.stored, false)
+  assert.strictEqual(rep.tip.seq, 3, 'the proof-only tip is at seq=3')
+  assert.strictEqual(rep.latest_recoverable_bundle.seq, 1, 'recover finds the real git-bundle genesis, not the proof-only ancestor')
+  assert.strictEqual(rep.latest_recoverable_bundle.artifact_txid, genesisArt)
+  assert.notStrictEqual(rep.latest_recoverable_bundle.artifact_txid, p2.txid, 'the proof-only ancestor is NOT reported as recoverable')
+  assert.strictEqual(rep.latest_recoverable_bundle.parts_present_in_walk, true, 'the real git-bundle genesis has all its parts present in the walk')
+
+  // RED: revert Fix A (key off the ref flag again) → the poison ancestor IS returned
+  const brokenPath = makeBrokenCopy(join(HERE, 'reader.mjs'), "if (art && art.kind === 'git-bundle') {", 'if (r.storesBytes !== false) {')
+  const broken = await import(pathToFileURL(brokenPath).href)
+  const bad = await broken.runReader({ repoId: repoAddr, localIn: m, out: join(ROOT, 'ra-broken.bundle'), quiet: true })
+  assert.strictEqual(bad.latest_recoverable_bundle.seq, 2, 'RED: the broken (ref-flag) recover returns the proof-only ancestor at seq=2')
+  assert.strictEqual(bad.latest_recoverable_bundle.artifact_txid, p2.txid, 'RED: it points at the proof-only artifact')
+})
+
+test('41. RED (VERIFY mismatch guard): neuter the VERIFY_MISMATCH throw → a bundle that does NOT match the on-chain commitment is falsely reported verified', async () => {
+  const fx = realFixture()
+  const other = makeRepoBundle({ commits: 2, filler: 70 }) // a DIFFERENT repo — wrong fingerprint
+  // intact: a non-matching bundle is REFUSED
+  await assert.rejects(() => rdr.runVerify({ repoId: repoAddr, localIn: fx.outDir, bundle: other.bundlePath, quiet: true }), /VERIFY_MISMATCH/, 'the intact VERIFY refuses a bundle that does not match the commitment')
+  // RED: neuter the mismatch throw → the wrong bundle sails through as verified
+  const brokenPath = makeBrokenCopy(join(HERE, 'reader.mjs'), "if (mismatches.length) throw refusal('VERIFY_MISMATCH'", "if (false) throw refusal('VERIFY_MISMATCH'")
+  const broken = await import(pathToFileURL(brokenPath).href)
+  const bad = await broken.runVerify({ repoId: repoAddr, localIn: fx.outDir, bundle: other.bundlePath, quiet: true })
+  assert.strictEqual(bad.verified, true, 'RED: without the mismatch guard, a non-matching bundle is falsely reported verified')
+})
+
+test('37. FIX B (VERIFY over-claim): a git-bundle chain missing a PART tx — VERIFY reports chain_storage=declared-unverified (never permanence off the fingerprint) while the reader REFUSES to reconstruct', async () => {
+  const fx = realFixture()
+  const m = join(ROOT, 'verify-missing-part')
+  const c = cloneChainDir(fx.outDir, m)
+  const partIdx = c.entries.findIndex((e) => typeof e.role === 'string' && e.role.startsWith('part'))
+  assert.ok(partIdx >= 0, 'the fixture has a part entry to drop')
+  c.entries.splice(partIdx, 1) // drop one PART tx from the source (manifest + ref remain)
+  writeFileSync(join(m, 'chain.json'), JSON.stringify(c, null, 2))
+
+  const v = await rdr.runVerify({ repoId: repoAddr, localIn: m, bundle: fx.repo.bundlePath, quiet: true })
+  assert.strictEqual(v.verified, true, 'the local bytes match the on-chain commitment')
+  assert.strictEqual(v.kind, 'git-bundle')
+  assert.strictEqual(v.chain_storage, 'declared-unverified', 'VERIFY does NOT bless a missing-part chain as stored')
+  assert.ok(!('stored' in v), 'no bare stored:true')
+  await assert.rejects(() => rdr.runReader({ repoId: repoAddr, localIn: m, out: join(ROOT, 'vmp.bundle'), quiet: true }), /PART_NOT_FOUND|PART_/, 'the reader refuses to reconstruct a chain missing a part')
+})
+
+test('38. FIX D (read-old-forever): a legacy git-bundle artifact with kind ABSENT but valid parts still classifies as git-bundle; kind-absent with NO parts still refuses', () => {
+  const A1 = FAKE64(1); const D1 = FAKE64(2)
+  const body = JSON.parse(pub.buildArtifactBody({ repo: 't/t', artifactSha256: A1, artifactBytes: 10, parts: [{ txid: A1, sha256: A1, bytes: 10 }], bundleRefsSha256: D1, label: 'x', publishedAt: 'z' }).toString('utf8'))
+  delete body.kind
+  assert.ok(!('kind' in body), 'the legacy record has no kind field')
+  const c = rdr.collectRecords(asWalk([artifactTxFromBody(body)]), repoAddr)
+  assert.strictEqual(c.artifacts.size, 1, 'the legacy git-bundle is collected')
+  assert.strictEqual([...c.artifacts.values()][0].kind, 'git-bundle', 'kind-absent + valid parts → git-bundle (the original reader ignored kind)')
+  const noParts = { ...body }; delete noParts.parts
+  assert.strictEqual(rdr.collectRecords(asWalk([artifactTxFromBody(noParts)]), repoAddr).rejected.find((r) => r.type === 0x02)?.code, 'UNSUPPORTED_ARTIFACT_KIND', 'kind-absent + no parts still refuses (never a silent proof-only)')
+})
+
+test('39. FIX C (retarget downgrade re-check): the mid-publish REF retarget re-applies the downgrade consent gate against the MOVED tip, before the rebuild', () => {
+  const src = readFileSync(join(HERE, 'publisher.mjs'), 'utf8')
+  const iRecheck = src.indexOf('if (proofOnly && s3.tipStoresBytes && !opts.downgradeToProofOnly)')
+  const iRebuild = src.indexOf('const newBody = buildRefBody({ repoId: repoAddress, seq: s3.tipSeq + 1')
+  assert.ok(iRecheck > 0, 'PIN: the retarget re-checks the downgrade condition against the moved tip s3')
+  assert.ok(iRebuild > 0 && iRecheck < iRebuild, 'PIN: the re-check precedes the REF rebuild')
+  assert.ok(src.includes('DOWNGRADE_REFUSED: the chain moved mid-publish and the new tip now STORES'), 'PIN: it refuses with a typed downgrade error, data txs left as PENDING strands')
+})
+
+test('40. FIX E (recover honesty, round-2 residual): a git-bundle ancestor with a MISSING part is named as the last full-bundle state with parts_present_in_walk=false — never a flat recoverable claim', async () => {
+  const fx = realFixture()
+  const genesisArt = fx.chain.plan.artifact_manifest_txid
+  const m = join(ROOT, 'recover-missing-part')
+  const c = cloneChainDir(fx.outDir, m)
+  const partIdx = c.entries.findIndex((e) => typeof e.role === 'string' && e.role.startsWith('part'))
+  assert.ok(partIdx >= 0, 'the fixture has a part entry to drop')
+  c.entries.splice(partIdx, 1) // a PART tx of the genesis git-bundle never landed
+  // bury the now-incomplete git-bundle genesis under an honest proof-only tip at seq=2
+  const p2 = artifactTxFromBody(JSON.parse(pub.buildArtifactBody({ mode: 'proof', repo: 'test/real', artifactSha256: FAKE64(400), artifactBytes: 100, bundleRefsSha256: FAKE64(401), label: 'x', publishedAt: 'z' }).toString('utf8')))
+  const r2 = refTxFromBody(pub.buildRefBody({ repoId: repoAddr, seq: 2, prev: fx.chain.plan.ref_manifest_txid, artifactTxid: p2.txid, refsSha256: FAKE64(401), storesBytes: false }))
+  writeFileSync(join(m, 'rmp-p2.hex'), p2.raw.toString('hex'))
+  writeFileSync(join(m, 'rmp-r2.hex'), r2.raw.toString('hex'))
+  c.entries.push({ txid: p2.txid, file: 'rmp-p2.hex' }, { txid: r2.txid, file: 'rmp-r2.hex' })
+  writeFileSync(join(m, 'chain.json'), JSON.stringify(c, null, 2))
+
+  const rep = await rdr.runReader({ repoId: repoAddr, localIn: m, out: join(ROOT, 'rmp.bundle'), quiet: true })
+  assert.strictEqual(rep.stored, false)
+  assert.strictEqual(rep.tip.seq, 2, 'the proof-only tip is at seq=2')
+  // recover still NAMES the git-bundle genesis (so the pointer exists) but HONESTLY flags its bytes are not all present
+  assert.strictEqual(rep.latest_recoverable_bundle.seq, 1)
+  assert.strictEqual(rep.latest_recoverable_bundle.artifact_txid, genesisArt)
+  assert.strictEqual(rep.latest_recoverable_bundle.parts_present_in_walk, false, 'a missing part → declared-full but NOT flatly recoverable (the same over-claim class FIX B removed from VERIFY)')
+})

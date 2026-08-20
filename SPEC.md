@@ -1,4 +1,4 @@
-# bgit wire format v1 — git artifacts on BSV (DRAFT v1.1, post codex-crypto review, 2026-08-15)
+# bgit wire format v1 — git artifacts on BSV (v1.4 — the v1.3 reviewed core + the §11 proof-only amendment, 2026-08-19)
 
 *The forever-format for g-417 (the Monero Mirror) and everything after it. Once one transaction
 is published in this format, v1 must be readable FOREVER — this document ships as part of the
@@ -131,8 +131,9 @@ BODY = varint(body_len) || body_bytes || 0x21 || pubkey(33, compressed) || varin
 
 `parts[]` order IS concatenation order; per-part sha256 makes each part independently verifiable
 and fetches resumable. `artifact_sha256` over the reassembled whole is the only success claim a
-reader trusts. `kind` extends later (`git-bundle-incremental` + `basis` = the bundle-chain).
-Unknown JSON fields MUST be ignored (additive evolution). **The ARTIFACT MANIFEST's signer MUST
+reader trusts. `kind` is a closed enum: `git-bundle` here, and `proof-only` (§11, a fingerprint-only
+notarization publish that OMITS `parts`); `git-bundle-incremental` + `basis` (the bundle-chain)
+remains reserved. Unknown JSON fields MUST be ignored (additive evolution). **The ARTIFACT MANIFEST's signer MUST
 be an authorized key of the REF chain at the manifest's mined position (the same §3 rule 2
 authorization set); a mismatch is a REFUSAL, not a disclosure** (v1.3, round-two: §3 binds the
 manifest to the ref-key lineage, so a foreign-signed manifest is invalid, full stop).
@@ -317,11 +318,145 @@ SHOULD equal the ref-tip signer; mismatch is DISCLOSED (round two may harden to 
 `artifact_bytes` is a REQUIRED reader check · the `spec` field is OPTIONAL on a first-ever
 publish (chicken-and-egg; the canary publish of this document fills it for the main publish).
 
+## 11. v1.4 AMENDMENT — the proof-only kind (notarization) (2026-08-19)
+
+*An ADDITIVE v1 extension: a second `kind` value that anchors a repository's FINGERPRINT on chain
+without its bytes. It proves EXISTENCE — the artifact existed, at this time, signed by this key,
+unaltered since — NOT permanence. The bytes stay in git; only the commitment is published, for a
+few hundred satoshis instead of ~$20/GB. Hardened the way this format was: a Claude adversarial
+workflow plus the OpenAI Codex (codex-crypto seat) review wire — a design pass, then two rounds on
+the built code; every finding folded, none rebutted. The trial record continues below, as before.*
+
+**THE ONE LAW of this amendment:** existence (proof-only) and permanence (a full git-bundle publish)
+MUST NEVER blur — at any surface, in any code path — and every ambiguity resolves TOWARD permanence.
+A reader that lets a proof-only publish be read, reported, or verified as bytes-on-chain has failed.
+Everything below serves that law, fail-closed.
+
+### 11.1 ARTIFACT MANIFEST (0x02) — the proof-only kind
+A proof-only artifact manifest is an ordinary 0x02 signed-body envelope with two differences:
+- `"kind": "proof-only"` in place of `"git-bundle"`.
+- **The `parts` key is ABSENT** — omitted entirely, never `[]` and never `null`. (An empty array
+  reconstructs to a zero-byte artifact a reader could "restore"; absence is the on-chain signal that
+  NO bytes were published.)
+The commitment fields are UNCHANGED and REQUIRED: `artifact_sha256`, `artifact_bytes`,
+`bundle_refs_sha256` (§4). They fingerprint the same `git bundle --all` an ordinary publish would
+have chunked — the repository is fully described, just not stored. `label`, `claimable`, `spec`,
+`published_at`, `source_hint` carry their usual meanings.
+
+```json
+{
+  "bgit": 1,
+  "kind": "proof-only",
+  "repo": "you/myrepo",
+  "source_hint": "https://github.com/you/myrepo",
+  "artifact_sha256": "<hex of the git bundle --all that is NOT published>",
+  "artifact_bytes": 269600118,
+  "bundle_refs_sha256": "<hex, §4>",
+  "label": "PROOF-ONLY",
+  "claimable": false,
+  "spec": "<txid of the on-chain copy of THIS document>",
+  "published_at": "2026-08-19T00:00:00Z"
+}
+```
+
+The only structural difference from the 0x02 example above is the flipped `kind` and the total
+ABSENCE of `parts` — that absence is the on-chain signal that no bytes were published, which is why
+`[]` and `null` are both refused (`PROOF_ONLY_HAS_PARTS` / §3 parts validation).
+
+### 11.2 REF MANIFEST (0x03) — the `stores_bytes` ratchet
+`kind` lives only in the artifact manifest, but the winner rule (§3) resolves on the REF chain, so
+the storage promise is ratcheted into the SIGNED ref body:
+- A new OPTIONAL boolean `stores_bytes`, emitted ONLY on a proof-only ref (where it is `false`). A
+  git-bundle ref OMITS it — so existing signed refs are byte-identical and their vectors unchanged.
+- **A reader reads an ABSENT `stores_bytes` as `true` (permanence)** — the read-old-forever default:
+  every REF MANIFEST published before this amendment has no such field and reads, correctly, as a
+  full-bundle ref.
+- Present → MUST be a boolean, else the record is rejected (`FIELD_INVALID:stores_bytes`).
+
+A proof-only ref is an ordinary 0x03 REF MANIFEST body (the §3 fields — `repo_id`, `seq`, `prev`,
+`artifact`, `refs_sha256`, `role`) plus the one added field:
+
+```json
+{ "...": "…ordinary 0x03 ref fields…", "stores_bytes": false }
+```
+
+### 11.3 THE WINNER RULE IS UNCHANGED
+`stores_bytes` and `kind` do NOT affect which chain wins. Resolution stays storage-blind — the
+genesis anchor, seq/prev validity, authorization, and permanent fork resolution (§3) select the tip
+exactly as before. proof-only adds two layers ON TOP of the resolved chain (a cross-check and a
+recovery view), never a change to resolution. A proof-only tip may therefore sit on a chain whose
+ancestors are full bundles, and the reverse.
+
+### 11.4 THE STORAGE CROSS-CHECK (reader, normative)
+Once the tip and its artifact manifest are resolved and their digests agree (§6.3), the reader MUST
+cross-check the tip's declared storage against its artifact's kind: the tip ref's `stores_bytes`
+(absent → `true`) MUST equal (`kind` of the tip's artifact === `git-bundle`). A mismatch is a
+REFUSAL (`STORAGE_KIND_MISMATCH`), not a disclosure. This is what makes a proof-only publish DECLARE
+itself: a proof-only artifact under a ref that omits `stores_bytes` (which reads as permanence) is
+refused — a proof-only publish can never masquerade as a full one, nor a full one be mislabeled.
+
+### 11.5 THE KIND CLASSIFIER (reader, normative)
+`kind` is a CLOSED enum. The reader classifies each artifact manifest as exactly one of `git-bundle`,
+`proof-only`, or REFUSED:
+- `kind === "git-bundle"` → REQUIRES a non-empty, well-formed `parts` array (§3).
+- `kind === "proof-only"` → REQUIRES the `parts` key ABSENT (present → `PROOF_ONLY_HAS_PARTS`).
+- **`kind` ABSENT + a valid non-empty `parts` array → `git-bundle`.** Read-old-forever: this format's
+  original reader ignored `kind` entirely and reconstructed any valid-parts artifact, so a pre-`kind`
+  record must still read. This branch REQUIRES real parts, so it stores real bytes — no proof-only
+  can reach it.
+- A `kind` present but outside the enum (a typo, a reserved-future value such as
+  `git-bundle-incremental`), or a `kind` ABSENT with no `parts` key at all, is REFUSED
+  (`UNSUPPORTED_ARTIFACT_KIND`). (An absent `kind` carrying a present-but-empty-or-malformed `parts`
+  array takes the legacy git-bundle path above and is rejected by the ordinary §3 parts validation —
+  `FIELD_INVALID:parts` — not the unknown-kind refusal; both refuse fail-closed.) Refusing loudly is
+  correct read-old-forever behaviour: a v1 record whose kind THIS reader does not implement is not
+  something to guess at — it says "upgrade your reader," never mishandles the bytes.
+
+### 11.6 RECONSTRUCTION AND RECOVERY (reader, normative)
+- A proof-only artifact is NEVER reconstructed. The reader returns its commitment (the three
+  fingerprints) and writes NO file — not even a partial one — in a distinct result that shares no
+  "verified / restored / cloned" vocabulary with a full read.
+- The reader ALSO reports the last recoverable FULL bundle on the winning chain: walk the resolved
+  chain from the tip toward genesis and name the highest-seq ref whose ARTIFACT is a classified
+  `git-bundle` — keyed off the classifier verdict, NOT the ref's self-declared `stores_bytes` (an
+  ancestor ref is not cross-checked during resolution, so trusting its flag here would let a
+  proof-only ancestor masquerade as recoverable). It further reports whether that ancestor's PART txs
+  are actually present in the walk — a git-bundle manifest can be mined while a part never lands, so
+  "the manifest DECLARES a full bundle" and "its bytes are reachable from this source" are separate,
+  separately reported facts. A proof-only tip can thus never HIDE the recoverable bytes beneath it,
+  nor falsely PROMISE bytes that are not there.
+
+### 11.7 VERIFYING A PROOF-ONLY REPOSITORY
+A proof-only publish stores no bytes, so its `bundle_refs_sha256` cannot be recomputed from chain.
+Verification therefore REQUIRES the caller's own local bundle: run `git bundle verify`, recompute all
+three fingerprints from the local bytes, and compare to the on-chain commitment. A full match proves
+the LOCAL copy is the one the chain anchored, unaltered — `VERIFIED_LOCAL_BYTES_NOT_STORED_ON_CHAIN`.
+A fingerprint or signature match ALONE, against no bytes, MUST NEVER be reported as "verified" or as
+chain reconstructability — verifying a fingerprint against nothing is meaningless.
+
+### 11.8 PUBLISHER POLICY — the downgrade is consent-gated
+Continuing a chain whose current tip STORES bytes with a proof-only publish is a permanence→existence
+DOWNGRADE (the tip flips to unrecoverable-at-the-tip). The publisher REFUSES it (`DOWNGRADE_REFUSED`)
+unless the operator explicitly opts in — checked at plan time AND again if the tip moves mid-publish.
+Even after a deliberate downgrade the reader still surfaces the last recoverable bundle (§11.6): belt
+and suspenders. (Publisher policy, not a reader rule — a reader validates the chain it is handed.)
+
+### 11.9 READ-OLD-FOREVER GUARANTEE
+proof-only is purely additive. Every repository published before it is UNAFFECTED: its artifacts
+carry `kind:"git-bundle"` and resolve byte-identically; its refs omit `stores_bytes` and read as
+permanence. A reader that does not implement this amendment refuses a proof-only record loudly
+(unknown kind) rather than mishandling it — a documented integrity floor, not a silent vanish.
+proof-only is durable to readers implementing v1.4+; older readers reject it by shape, exactly as
+§0.1 requires.
+
 ## Provenance
 
 Designed and hardened 2026-08-14/15. Three adversarial review rounds by OpenAI Codex
 (codex-crypto seat) over a signed cross-vendor coordination wire; verdicts CHANGES-REQUIRED,
-CHANGES-REQUIRED, PUBLISH-WITH-CHANGES; every finding folded, zero rebutted. The review record
-above is part of this document deliberately: a forever-format should carry its own trial
-transcript. This document is also published ON CHAIN as the first bgit repository
+CHANGES-REQUIRED, PUBLISH-WITH-CHANGES; every finding folded, zero rebutted. The §11 v1.4
+proof-only amendment (2026-08-19) was hardened the same way — a Claude adversarial workflow (a
+design pass, then two rounds on the built code) plus the codex-crypto review wire; three defects
+and a compatibility caveat found and folded, none rebutted, each pinned to a red-proven test. The
+review record above is part of this document deliberately: a forever-format should carry its own
+trial transcript. This document is also published ON CHAIN as the first bgit repository
 (repo_id 19Zb3LTpheqZ3XDxJyPEuDcCPyd1re9tWo) — the format hosts itself.

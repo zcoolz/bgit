@@ -148,21 +148,36 @@ export function p2pkhScript (address) {
 // ---------------------------------------------------------------------------
 // manifest bodies (§3) — literal bytes are what gets signed; field order follows the spec sample.
 // ---------------------------------------------------------------------------
-export function buildArtifactBody ({ repo, sourceHint, artifactSha256, artifactBytes, parts, bundleRefsSha256, label, specTxid, publishedAt }) {
-  const body = { bgit: 1, kind: 'git-bundle', repo }
+// The artifact `kind` is a CLOSED enum derived from an explicit MODE — a caller says what it is
+// DOING (a full publish that puts bytes on chain, or a proof-only publish that puts only the
+// fingerprint), and never hands in a raw kind+parts pair that could disagree with itself.
+export const ARTIFACT_MODES = { full: 'git-bundle', proof: 'proof-only' }
+
+export function buildArtifactBody ({ mode = 'full', repo, sourceHint, artifactSha256, artifactBytes, parts, bundleRefsSha256, label, specTxid, publishedAt }) {
+  const kind = ARTIFACT_MODES[mode]
+  if (!kind) throw new Error(`buildArtifactBody: unknown mode ${JSON.stringify(mode)} (expected 'full' or 'proof')`)
+  const body = { bgit: 1, kind, repo }
   if (sourceHint) body.source_hint = sourceHint
   body.artifact_sha256 = artifactSha256
   body.artifact_bytes = artifactBytes
-  body.parts = parts // [{ txid, sha256, bytes }] — order IS concatenation order
+  // full → `parts` carry the bytes (order IS concatenation order). proof-only → the `parts` key is
+  // OMITTED entirely (never [] — an empty array reconstructs to a 0-byte artifact a reader would
+  // happily "restore"). The ABSENCE of parts is the on-chain signal that no bytes were stored.
+  if (mode === 'full') body.parts = parts
   body.bundle_refs_sha256 = bundleRefsSha256
   body.label = label
   body.claimable = true
   if (specTxid) body.spec = specTxid
   body.published_at = publishedAt
+  // the assert (both directions): the finished body's kind and its parts-shape MUST agree, or
+  // refuse before anything is signed or broadcast — a body that lies about its own storage cannot
+  // be built, not merely rejected later on read.
+  if (kind === 'git-bundle' && (!Array.isArray(body.parts) || body.parts.length === 0)) throw new Error('buildArtifactBody: git-bundle requires non-empty parts')
+  if (kind === 'proof-only' && ('parts' in body)) throw new Error('buildArtifactBody: proof-only must not carry a parts key')
   return Buffer.from(JSON.stringify(body), 'utf8')
 }
 
-export function buildRefBody ({ repoId, seq, prev, artifactTxid, refsSha256, role = 'unsigned-mirror', claimHow = CLAIM_HOW }) {
+export function buildRefBody ({ repoId, seq, prev, artifactTxid, refsSha256, role = 'unsigned-mirror', storesBytes, claimHow = CLAIM_HOW }) {
   const body = {
     bgit: 1,
     repo_id: repoId,
@@ -172,6 +187,12 @@ export function buildRefBody ({ repoId, seq, prev, artifactTxid, refsSha256, rol
     refs_sha256: refsSha256,
     role,
   }
+  // stores_bytes (the storage ratchet — razor HOLE 3 PREVENT): a SIGNED declaration of whether the
+  // pointed-at artifact puts its bytes on chain. Present ONLY on proof-only refs (false); a
+  // git-bundle ref OMITS it, and readers read ABSENT as true (permanence). That default is what
+  // keeps every pre-proof-only repo readable AND forces a proof-only publish to declare itself out
+  // loud in the signed bytes — a proof-only artifact under a stores-absent ref is refused on read.
+  if (storesBytes !== undefined) body.stores_bytes = storesBytes
   // 7b7f878e: claim_how ONLY on unsigned mirrors — a maintainer ref must not advertise an
   // invitation that has already been exercised. null claimHow omits the field entirely.
   if (claimHow != null && role === 'unsigned-mirror') body.claim_how = claimHow
@@ -313,6 +334,13 @@ export async function runPublisher (opts) {
     const snapOpts = { repoId: repoAddress, localIn: opts.chainIn, historyUrl: opts.historyUrl, txUrl: opts.txUrl, source: opts.source }
     const snap = await walkSnapshot(snapOpts)
     if (!snap.tipMined) throw new Error('TIP_UNMINED: the current tip is not mined — a continuation binding an unmined tip can become a permanent fork loser; wait for burial')
+    // razor HOLE 3 PREVENT: refuse a permanence→proof-only downgrade. If this chain's current tip
+    // stores its bytes on chain and this continuation would store only a fingerprint, the tip flips
+    // to "unrecoverable" — a deliberate, dangerous act. Require the explicit flag. (Even a
+    // deliberate downgrade stays safe: the reader still surfaces the last recoverable full bundle.)
+    if (opts.proofOnly && snap.tipStoresBytes && !opts.downgradeToProofOnly) {
+      throw new Error('DOWNGRADE_REFUSED: the current tip stores its bytes on chain (permanence); a proof-only continuation would make the repo look unrecoverable at the tip. Re-run with --downgrade-to-proof-only if that is truly intended (the reader will still point back to the last full bundle).')
+    }
     const isGenesis = signerPubkey === snap.genesisPubkey
     if (!isGenesis && !snap.granted.has(signerPubkey)) {
       throw new Error('UNAUTHORIZED_KEY: this key is neither the genesis key nor an accepted claimant on this chain — the reader would reject the ref; refusing before any satoshi moves')
@@ -337,7 +365,10 @@ export async function runPublisher (opts) {
 
   const bundle = readFileSync(bundlePath)
   const artifactSha = sha256hex(bundle)
-  const nParts = Math.ceil(bundle.length / partBytes)
+  // proof-only: publish ONLY the fingerprint (an ARTIFACT MANIFEST + a REF, no PART txs, ~132 sats).
+  // The bundle is still READ and hashed to compute the commitment; its bytes never go on chain.
+  const proofOnly = !!opts.proofOnly
+  const nParts = proofOnly ? 0 : Math.ceil(bundle.length / partBytes)
 
   // part plan (shas up front; txids appear as txs are built)
   const partPlan = []
@@ -354,8 +385,9 @@ export async function runPublisher (opts) {
   // sizing (identical length to the real ones, so the plan is exact).
   const placeholderParts = partPlan.map((p) => ({ txid: '0'.repeat(64), sha256: p.sha256, bytes: p.bytes }))
   const artifactBodySize = buildArtifactBody({
+    mode: proofOnly ? 'proof' : 'full',
     repo: opts.repo, sourceHint: opts.sourceHint, artifactSha256: artifactSha, artifactBytes: bundle.length,
-    parts: placeholderParts, bundleRefsSha256: refsDigest, label, specTxid: opts.specTxid, publishedAt,
+    parts: proofOnly ? undefined : placeholderParts, bundleRefsSha256: refsDigest, label, specTxid: opts.specTxid, publishedAt,
   }).length
   const refBodySize = buildRefBody({
     repoId: repoAddress,
@@ -364,6 +396,7 @@ export async function runPublisher (opts) {
     artifactTxid: '0'.repeat(64),
     refsSha256: refsDigest,
     role: cont ? cont.role : 'unsigned-mirror',
+    storesBytes: proofOnly ? false : undefined,
   }).length
   const envelopeOverhead = (bodyLen) => 2 + encodeVarint(bodyLen).length + 1 + 33 + 1 + 72 // header+varint+0x21+pub+varint+maxDER
 
@@ -382,6 +415,10 @@ export async function runPublisher (opts) {
     repo: opts.repo,
     repo_id: repoAddress,
     fund_address: signerAddress, // genesis: == repo_id. --continue: the SIGNING key gets funded
+    kind: proofOnly ? 'proof-only' : 'git-bundle',
+    stores_bytes: !proofOnly,
+    bytes_on_chain: !proofOnly,
+    permanence: proofOnly ? 'none' : 'chain',
     ...(cont ? { continues: { from_seq: cont.snap.tipSeq, prev_ref: cont.prevRef, role: cont.role, snapshot_digest: cont.snap.digest } } : {}),
     bundle: bundlePath,
     artifact_bytes: bundle.length,
@@ -460,8 +497,9 @@ export async function runPublisher (opts) {
   }
 
   const artifactBody = buildArtifactBody({
+    mode: proofOnly ? 'proof' : 'full',
     repo: opts.repo, sourceHint: opts.sourceHint, artifactSha256: artifactSha, artifactBytes: bundle.length,
-    parts: partEntries, bundleRefsSha256: refsDigest, label, specTxid: opts.specTxid, publishedAt,
+    parts: proofOnly ? undefined : partEntries, bundleRefsSha256: refsDigest, label, specTxid: opts.specTxid, publishedAt,
   })
   {
     const record = signedRecord(TYPE_ARTIFACT, artifactBody, privKey)
@@ -483,6 +521,7 @@ export async function runPublisher (opts) {
     artifactTxid: plan.artifact_manifest_txid,
     refsSha256: refsDigest,
     role: cont ? cont.role : 'unsigned-mirror',
+    storesBytes: proofOnly ? false : undefined,
   })
   let refTxPrev = null // captured for the 7b7f878e mid-publish retarget (rebuild spends the same outpoint)
   {
@@ -511,7 +550,7 @@ export async function runPublisher (opts) {
 
   // ---- plan report ----
   const lines = []
-  lines.push('=== bgit publish plan (DRY RUN' + (opts.broadcast ? ' → BROADCAST' : '') + ') ===')
+  lines.push('=== bgit publish plan (DRY RUN' + (opts.broadcast ? ' → BROADCAST' : '') + (proofOnly ? ' · PROOF ONLY — bytes are NOT stored on chain' : '') + ') ===')
   lines.push(`spec:               ${plan.spec}`)
   lines.push(`repo:               ${plan.repo}`)
   lines.push(`repo_id:            ${plan.repo_id}`)
@@ -519,11 +558,13 @@ export async function runPublisher (opts) {
   // continues someone else's chain — printing one label for both would misdirect real money
   lines.push(`fund THIS address:  ${plan.fund_address}${plan.fund_address === plan.repo_id ? '' : '  (the signing key, not the repo)'}`)
   lines.push(`bundle:             ${plan.bundle}`)
-  lines.push(`artifact bytes:     ${plan.artifact_bytes.toLocaleString('en-US')}`)
+  lines.push(`artifact bytes:     ${plan.artifact_bytes.toLocaleString('en-US')}${proofOnly ? '  (NOT stored on chain — only the fingerprint below is published)' : ''}`)
   lines.push(`artifact sha256:    ${plan.artifact_sha256}`)
   lines.push(`bundle_refs_sha256: ${plan.bundle_refs_sha256}`)
-  lines.push(`parts:              ${plan.parts} × ≤${partBytes.toLocaleString('en-US')} bytes`)
-  lines.push(`transactions:       ${plan.tx_count} (${plan.parts} PART + 1 ARTIFACT MANIFEST + 1 REF MANIFEST seq=${cont ? cont.seq : 1}${cont ? `, role ${cont.role}, continuing ${cont.prevRef.slice(0, 12)}…` : ''})`)
+  lines.push(proofOnly
+    ? 'parts:              0 (PROOF ONLY — the code stays in git; only its fingerprint is published)'
+    : `parts:              ${plan.parts} × ≤${partBytes.toLocaleString('en-US')} bytes`)
+  lines.push(`transactions:       ${plan.tx_count} (${proofOnly ? '1 ARTIFACT MANIFEST (proof-only)' : `${plan.parts} PART + 1 ARTIFACT MANIFEST`} + 1 REF MANIFEST seq=${cont ? cont.seq : 1}${cont ? `, role ${cont.role}, continuing ${cont.prevRef.slice(0, 12)}…` : ''})`)
   lines.push(`fee rate:           ${FEE_RATE_SAT_PER_KB} sat/KB`)
   lines.push(`total fee:          ${plan.total_fee_sats.toLocaleString('en-US')} sats`)
   lines.push(`dust (${DUST_SATS}/tx):        ${plan.dust_sats_total.toLocaleString('en-US')} sats`)
@@ -570,8 +611,16 @@ export async function runPublisher (opts) {
           if (!s3.tipMined || !stillAuthorized) {
             throw new Error(`CHAIN_MOVED: the chain moved mid-publish and the continuation is no longer lawful (${!s3.tipMined ? 'the new tip is unmined' : 'this key is no longer authorized at the tip'}). Already-posted data txs are honest PENDING strands, reusable by a fresh --continue: ${posted.join(', ') || '(none)'}`)
           }
+          // razor HOLE 3 PREVENT (retarget re-check): the plan-time downgrade gate (:314) evaluated
+          // the OLD tip. If the tip moved to a bundle that now STORES bytes, retargeting a proof-only
+          // REF onto it is exactly the permanence→proof-only downgrade that gate exists to consent-
+          // gate — but no --downgrade-to-proof-only was required at plan time (the old tip was
+          // proof-only). Re-apply the gate against the moved tip; refuse rather than silently bury it.
+          if (proofOnly && s3.tipStoresBytes && !opts.downgradeToProofOnly) {
+            throw new Error(`DOWNGRADE_REFUSED: the chain moved mid-publish and the new tip now STORES its bytes on chain (permanence); retargeting this proof-only continuation onto it would be an unconsented permanence→proof-only downgrade. Re-run --continue with --downgrade-to-proof-only if that is truly intended. Already-posted data txs are honest PENDING strands: ${posted.join(', ') || '(none)'}`)
+          }
           process.stderr.write(`[bgit] chain moved mid-publish — retargeting REF: seq ${cont.seq}→${s3.tipSeq + 1}, prev ${cont.prevRef.slice(0, 12)}…→${s3.tipTxid.slice(0, 12)}…\n`)
-          const newBody = buildRefBody({ repoId: repoAddress, seq: s3.tipSeq + 1, prev: s3.tipTxid, artifactTxid: plan.artifact_manifest_txid, refsSha256: refsDigest, role: cont.role })
+          const newBody = buildRefBody({ repoId: repoAddress, seq: s3.tipSeq + 1, prev: s3.tipTxid, artifactTxid: plan.artifact_manifest_txid, refsSha256: refsDigest, role: cont.role, storesBytes: proofOnly ? false : undefined })
           const newRecord = signedRecord(TYPE_REF, newBody, privKey)
           const newFee = feeFor(estimateTxSize(newRecord.length))
           const rebuilt = await buildTx({ sdk, privKey, repoAddress, record: newRecord, prev: refTxPrev, changeSats: refTxPrev.satoshis - DUST_SATS - newFee })
@@ -710,6 +759,8 @@ function parseArgs (argv) {
       case '--tx-url': o.txUrl = next(); break
       case '--source': o.source = next(); break
       case '--role': o.role = next(); break
+      case '--proof-only': o.proofOnly = true; break
+      case '--downgrade-to-proof-only': o.downgradeToProofOnly = true; break
       case '--status-url': o.statusUrl = next(); break
       case '--confirm': o.confirm = true; break
       default: throw new Error(`unknown flag: ${a}`)

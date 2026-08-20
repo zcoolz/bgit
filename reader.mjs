@@ -404,6 +404,9 @@ function checkRefFields (json, repoId) {
   if (json.seq === 1 ? json.prev !== null : !isHex64(json.prev)) return 'FIELD_INVALID:prev' // §3 "null iff seq == 1"
   if (!isHex64(json.artifact)) return 'FIELD_INVALID:artifact'
   if (!isHex64(json.refs_sha256)) return 'FIELD_INVALID:refs_sha256'
+  // stores_bytes (razor HOLE 3): PRESENT → must be a boolean; ABSENT → legacy git-bundle
+  // (read-old-forever — every pre-proof-only ref omits it and reads as permanence).
+  if ('stores_bytes' in json && typeof json.stores_bytes !== 'boolean') return 'FIELD_INVALID:stores_bytes'
   return null
 }
 function checkClaimFields (json, repoId, envelopePubkey) {
@@ -414,16 +417,41 @@ function checkClaimFields (json, repoId, envelopePubkey) {
   if (!isHex64(json.target_ref)) return 'FIELD_INVALID:target_ref'
   return null
 }
-function checkArtifactFields (json) {
-  if (json.bgit !== 1) return 'FIELD_INVALID:bgit'
-  if (!isHex64(json.artifact_sha256)) return 'FIELD_INVALID:artifact_sha256'
-  if (!Number.isInteger(json.artifact_bytes) || json.artifact_bytes < 0) return 'FIELD_INVALID:artifact_bytes'
-  if (!Array.isArray(json.parts) || json.parts.length === 0) return 'FIELD_INVALID:parts'
-  for (const p of json.parts) {
-    if (typeof p !== 'object' || p === null || !isHex64(p.txid) || !isHex64(p.sha256) || !Number.isInteger(p.bytes) || p.bytes < 0) return 'FIELD_INVALID:parts[]'
+// The ONE total artifact classifier (razor HOLE 1 fix). `kind` is REQUIRED, checked against a
+// CLOSED allow-list, and the own-property SHAPE must match the kind:
+//   git-bundle → non-empty, well-formed parts (the bytes live on chain)
+//   proof-only → the `parts` key is ABSENT (not null, not [] — an empty array reconstructs to a
+//                0-byte artifact a reader would "restore" as success)
+// Anything else — kind absent, non-string, a typo (`proof_only`), or a reserved-future value such
+// as `git-bundle-incremental` — is UNSUPPORTED_ARTIFACT_KIND: refuse LOUDLY. That is the documented
+// integrity floor of read-old-forever (§0.1): a v1 record whose kind THIS reader does not implement
+// is not something to guess at — refusing says "upgrade your reader," never mishandles the bytes.
+// Returns { kind } to accept (the THREADED verdict every downstream branch keys off — no branch
+// re-tests the raw string) or { error } to reject.
+function classifyArtifactFields (json) {
+  if (json.bgit !== 1) return { error: 'FIELD_INVALID:bgit' }
+  if (!isHex64(json.artifact_sha256)) return { error: 'FIELD_INVALID:artifact_sha256' }
+  if (!Number.isInteger(json.artifact_bytes) || json.artifact_bytes < 0) return { error: 'FIELD_INVALID:artifact_bytes' }
+  if (!isHex64(json.bundle_refs_sha256)) return { error: 'FIELD_INVALID:bundle_refs_sha256' }
+  // read-old-forever (codex-crypto cross-vendor caveat): the current publisher ALWAYS stamps
+  // kind:'git-bundle', but the ORIGINAL reader ignored `kind` entirely and reconstructed any
+  // valid-parts artifact — so a pre-`kind` legacy git-bundle (kind ABSENT + valid parts) must still
+  // classify as git-bundle, never fall through the new unknown-kind refusal. proof-only ALWAYS
+  // declares kind:'proof-only' explicitly, so an absent kind is never proof-only (no masquerade:
+  // this branch REQUIRES real non-empty parts, i.e. bytes genuinely on chain).
+  const kindAbsent = !('kind' in json)
+  if (json.kind === 'git-bundle' || (kindAbsent && Array.isArray(json.parts))) {
+    if (!Array.isArray(json.parts) || json.parts.length === 0) return { error: 'FIELD_INVALID:parts' }
+    for (const p of json.parts) {
+      if (typeof p !== 'object' || p === null || !isHex64(p.txid) || !isHex64(p.sha256) || !Number.isInteger(p.bytes) || p.bytes < 0) return { error: 'FIELD_INVALID:parts[]' }
+    }
+    return { kind: 'git-bundle' }
   }
-  if (!isHex64(json.bundle_refs_sha256)) return 'FIELD_INVALID:bundle_refs_sha256'
-  return null
+  if (json.kind === 'proof-only') {
+    if ('parts' in json) return { error: 'PROOF_ONLY_HAS_PARTS' } // the key must be ABSENT, not [] or null
+    return { kind: 'proof-only' }
+  }
+  return { error: 'UNSUPPORTED_ARTIFACT_KIND' } // kind present-but-unknown, OR absent with no valid parts
 }
 
 // ---------------------------------------------------------------------------
@@ -490,13 +518,14 @@ export function collectRecords (txs, repoId) {
         out.refs.push({
           txid: tx.txid, minedIdx, height: h, seq: env.json.seq, prev: env.json.prev === null ? null : lc(env.json.prev),
           artifact: lc(env.json.artifact), refs_sha256: lc(env.json.refs_sha256), role: env.json.role,
+          storesBytes: 'stores_bytes' in env.json ? env.json.stores_bytes : true, // absent = git-bundle (read-old-forever)
           pubkey: env.pubkey, json: env.json,
         })
       }
     } else if (type === T_ARTIFACT) {
-      const ferr = checkArtifactFields(env.json)
-      if (ferr) { out.rejected.push({ txid: tx.txid, code: ferr, type }) } else {
-        out.artifacts.set(tx.txid, { txid: tx.txid, minedIdx, height: h, json: env.json, pubkey: env.pubkey })
+      const cls = classifyArtifactFields(env.json)
+      if (cls.error) { out.rejected.push({ txid: tx.txid, code: cls.error, type }) } else {
+        out.artifacts.set(tx.txid, { txid: tx.txid, minedIdx, height: h, json: env.json, pubkey: env.pubkey, kind: cls.kind })
       }
     } else if (type === T_CLAIM) {
       const ferr = checkClaimFields(env.json, repoId, env.pubkey)
@@ -811,6 +840,7 @@ export async function walkSnapshot ({ repoId, localIn, historyUrl, txUrl, source
     tipRole: typeof tip.role === 'string' ? tip.role : null,
     tipPubkey: tip.pubkey || null,
     tipMined: tip.mined !== false,
+    tipStoresBytes: tip.storesBytes !== false, // razor HOLE 3: --continue reads this to refuse a permanence→proof-only downgrade
     genesisPubkey,
     granted,
     acceptedClaims: accepted,
@@ -909,6 +939,97 @@ export async function runReader (opts) {
   }
   pass('REF_AND_ARTIFACT_DIGESTS_AGREE')
 
+  // ---- razor HOLE 3: the storage cross-check + the RECOVER walk ----
+  // The tip's SIGNED stores_bytes MUST agree with its artifact's kind. Absent stores_bytes reads as
+  // true (git-bundle / permanence — the read-old-forever default), so a proof-only artifact under a
+  // stores-absent (or stores=true) ref is a MISMATCH and refuses: a proof-only publish must declare
+  // itself in the signed ref; it can never masquerade as permanent.
+  const tipStores = tip.storesBytes !== false
+  const artifactStores = artifact.kind === 'git-bundle'
+  if (tipStores !== artifactStores) {
+    throw refusal('STORAGE_KIND_MISMATCH', `ref tip declares stores_bytes=${tipStores} but its artifact kind is "${artifact.kind}" — a proof-only publish must be declared as stores_bytes=false in the signed ref`)
+  }
+
+  // RECOVER: the most recent recoverable state on the winning chain — the highest-seq ref whose
+  // ARTIFACT is a classified git-bundle (bytes on chain), so a proof-only tip can never hide the
+  // recoverable bytes. We key off the artifact's THREADED kind verdict, NOT the ref's self-declared
+  // stores_bytes: ancestor refs are never cross-checked during resolution (only the tip is), so
+  // trusting an ancestor's flag here would let a proof-only ancestor masquerade as recoverable, or a
+  // mislabeled ref hide a real bundle, or an uncollected artifact surface with null fingerprints. The
+  // classifier verdict is the authority — the same law STORAGE_KIND_MISMATCH applies to the tip.
+  let latestRecoverable = null
+  for (let i = chain.length - 1; i >= 0; i--) {
+    const r = chain[i]
+    const art = col.artifacts.get(r.artifact)
+    if (art && art.kind === 'git-bundle') {
+      // FIX B's honesty law applied to the recover pointer (round-2 residual): a git-bundle
+      // classifies on its parts-ARRAY SHAPE, but a PART tx can be mined-then-absent (never landed /
+      // pruned / outside this source's walk). So DON'T flatly claim "recoverable" — report whether
+      // every part tx is actually present in THIS walk. If not, reconstruction would fail
+      // PART_NOT_FOUND: the manifest DECLARES a full bundle, but the bytes are not all reachable here.
+      const partsPresentInWalk = Array.isArray(art.json.parts) && art.json.parts.every((p) => col.parts.has(lc(p.txid)))
+      latestRecoverable = {
+        seq: r.seq,
+        ref_txid: r.txid,
+        artifact_txid: r.artifact,
+        artifact_sha256: lc(art.json.artifact_sha256),
+        artifact_bytes: art.json.artifact_bytes,
+        parts_present_in_walk: partsPresentInWalk,
+      }
+      break
+    }
+  }
+
+  // ---- proof-only (razor HOLE 2 + the reconstruction seam): NEVER reconstruct. Return the
+  //      commitment + the last recoverable bundle, in a DISJOINT success contract — stored:false,
+  //      its own banner, no `artifact` block, no `out`, none of the VERIFIED/clone cascade. This
+  //      fork happens BEFORE any file is created (no partial .part can exist). ----
+  if (artifact.kind === 'proof-only') {
+    if (opts.out) pass('PROOF_ONLY_NO_OUTPUT', '--out ignored — proof-only stores no bytes; nothing is written')
+    const commitment = {
+      artifact_sha256: lc(artifact.json.artifact_sha256),
+      artifact_bytes: artifact.json.artifact_bytes,
+      bundle_refs_sha256: lc(artifact.json.bundle_refs_sha256),
+    }
+    pass('PROOF_ONLY_COMMITMENT_READ', `${commitment.artifact_sha256} (${commitment.artifact_bytes.toLocaleString('en-US')} bytes, NOT on chain)`)
+    if (col.pendingTxs.length) pass('PENDING_DISCLOSED', `${col.pendingTxs.length} unmined tx(s) reported PENDING, never the tip`)
+    const result = {
+      ok: true,
+      stored: false,
+      kind: 'proof-only',
+      bytes_on_chain: false,
+      permanence: 'none',
+      out: null,
+      repo_id: repoId,
+      tip: { txid: tip.txid, seq: tip.seq, role: tip.role, pubkey: tip.pubkey },
+      chain: chainReport.keyLineage,
+      commitment,
+      latest_recoverable_bundle: latestRecoverable,
+      claims: claimResults,
+      skipped: col.skipped,
+      rejected: col.rejected,
+      ignoredMultiOutput: col.ignoredMultiOutput,
+      forkReport: chainReport,
+      pending: col.pendingTxs,
+      checks,
+    }
+    if (opts.report) writeFileSync(resolve(opts.report), JSON.stringify(result, null, 2))
+    if (!opts.quiet) {
+      console.log('\n=== bgit reader: PROOF ONLY — bytes are NOT on chain ===')
+      console.log(`repo_id:    ${repoId}`)
+      console.log(`tip:        seq=${tip.seq} ${tip.txid} (${tip.role}) — kind=proof-only`)
+      console.log(`commitment: artifact_sha256    ${commitment.artifact_sha256}`)
+      console.log(`            artifact_bytes     ${commitment.artifact_bytes.toLocaleString('en-US')}`)
+      console.log(`            bundle_refs_sha256 ${commitment.bundle_refs_sha256}`)
+      console.log('THIS PROVES EXISTENCE, NOT PERMANENCE — the code is NOT stored on chain. Keep your git copy.')
+      console.log(`verify a local copy: reader.mjs --verify --repo-id ${repoId} --bundle <file> --local-in <dir>`)
+      if (latestRecoverable && latestRecoverable.parts_present_in_walk) console.log(`last recoverable bundle: seq=${latestRecoverable.seq}, artifact ${latestRecoverable.artifact_txid} (all parts present in this source)`)
+      else if (latestRecoverable) console.log(`last full-bundle state: seq=${latestRecoverable.seq}, artifact ${latestRecoverable.artifact_txid} — the manifest DECLARES a full git-bundle, but not all its part txs are present in this source; run the reader / cross-check a source before relying on it as recoverable`)
+      else console.log('no earlier permanent (git-bundle) state exists on this chain — nothing is recoverable from chain.')
+    }
+    return result
+  }
+
   // ---- §6.3 fetch/extract/verify each part in order; concatenate ----
   const partSrc = buildPartSource({ localDir, txs, opts })
   const repoScriptBuf = p2pkhScriptFor(repoId) // §5 v1.3: dust enforced on PART txs here too
@@ -975,11 +1096,16 @@ export async function runReader (opts) {
 
   const result = {
     ok: true,
+    stored: true,
+    kind: 'git-bundle',
+    bytes_on_chain: true,
+    permanence: 'chain',
     out: outPath,
     repo_id: repoId,
     tip: { txid: tip.txid, seq: tip.seq, role: tip.role, pubkey: tip.pubkey },
     chain: chainReport.keyLineage,
     artifact: { txid: artifact.txid, bytes: totalBytes, sha256: lc(artifact.json.artifact_sha256), repo: artifact.json.repo, label: artifact.json.label },
+    latest_recoverable_bundle: latestRecoverable,
     refs_sha256: refsDigest,
     claims: claimResults,
     skipped: col.skipped,
@@ -1019,6 +1145,125 @@ function buildPartSource ({ localDir, txs }) {
 }
 
 // ---------------------------------------------------------------------------
+// THE VERIFY VERB — check a LOCAL bundle against the on-chain commitment.
+// Full publishes RECONSTRUCT (the chain holds the bytes); proof-only publishes VERIFY (the chain
+// holds only the fingerprint — YOU hold the bytes). VERIFY REQUIRES the caller's local bundle,
+// runs `git bundle verify`, recomputes ALL THREE fingerprints, and compares them to the chain's
+// commitment. A fingerprint or signature match ALONE never earns the word "verified artifact":
+// verifying a fingerprint against nothing is meaningless — the bytes must be present and checked.
+// ---------------------------------------------------------------------------
+
+// `git bundle verify` needs a repository context (probed); wrap it in a throwaway repo.
+function gitBundleVerify (bundlePath) {
+  const abs = resolve(bundlePath)
+  const dir = mkdtempSync(join(tmpdir(), 'bgit-verify-'))
+  try {
+    const init = spawnSync('git', ['init', '-q', dir], { encoding: 'utf8' })
+    if (init.status !== 0) return { ok: false, output: `git init failed: ${(init.stderr || '').trim()}` }
+    const r = spawnSync('git', ['-C', dir, 'bundle', 'verify', abs], { encoding: 'utf8' })
+    return { ok: r.status === 0, output: `${r.stdout || ''}${r.stderr || ''}`.trim() }
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true }) } catch {}
+  }
+}
+
+export async function runVerify (opts) {
+  const repoId = opts.repoId
+  if (!repoId) throw refusal('USAGE', '--repo-id required')
+  if (!opts.bundle) throw refusal('USAGE', '--verify requires --bundle <file> — proof-only stores no bytes on chain, so verification needs the bytes YOU hold')
+  const bundlePath = resolve(opts.bundle)
+  if (!existsSync(bundlePath)) throw refusal('BUNDLE_NOT_FOUND', bundlePath)
+  const pass = (name, detail) => { if (!opts.quiet) console.log(`  ✓ ${name}${detail ? ` — ${detail}` : ''}`) }
+
+  // ---- resolve the chain + fetch the tip's artifact commitment (same source rules as the reader) ----
+  let txs; let orderAuthoritative = false
+  if (opts.localIn) {
+    const src = readLocalTxs(resolve(opts.localIn))
+    txs = src.txs; orderAuthoritative = src.orderAuthoritative
+  } else {
+    let historyUrl = opts.historyUrl; let txUrl = opts.txUrl
+    if (opts.source) {
+      const p = SOURCE_PRESETS[opts.source]
+      if (!p) throw refusal('USAGE', `unknown --source ${opts.source} (have: ${Object.keys(SOURCE_PRESETS).join(', ')})`)
+      historyUrl = historyUrl || p.historyUrl; txUrl = txUrl || p.txUrl
+    }
+    if (!historyUrl || !txUrl) throw refusal('USAGE', 'need --local-in OR (--history-url AND --tx-url) OR --source <preset>')
+    txs = await readNetworkTxs(historyUrl, txUrl, repoId)
+  }
+  const col = collectRecords(txs, repoId)
+  const { tip, report: chainReport } = resolveChain(col.refs, col.claims, { orderAuthoritative })
+  if (!tip) throw refusal('NO_GENESIS', `no valid seq=1 REF MANIFEST for ${repoId} (cross-check a second source before concluding)`)
+  if (chainReport.ambiguousSameBlock.length) throw refusal('AMBIGUOUS_MINED_ORDER', 'order-dependent verdict and this source has no intra-block index — re-read from a source with block data')
+  const artifact = col.artifacts.get(tip.artifact)
+  if (!artifact) throw refusal('NO_ARTIFACT_MANIFEST', `tip cites ${tip.artifact} — not a valid 0x02 record in this walk`)
+  // the same integrity guards the reconstruction path applies (signer authorization + storage cross-check)
+  const artifactAuth = authorizedKeysAt(chainReport, artifact.minedIdx)
+  if (!artifactAuth.has(artifact.pubkey.toLowerCase())) throw refusal('ARTIFACT_SIGNER_UNAUTHORIZED', `artifact ${artifact.txid.slice(0, 12)}… signed by a key not authorized on this ref chain`)
+  const tipStores = tip.storesBytes !== false
+  if (tipStores !== (artifact.kind === 'git-bundle')) throw refusal('STORAGE_KIND_MISMATCH', `ref tip declares stores_bytes=${tipStores} but its artifact kind is "${artifact.kind}"`)
+  if (tip.refs_sha256 !== lc(artifact.json.bundle_refs_sha256)) throw refusal('REFS_DIGEST_CROSS_MISMATCH', 'ref refs_sha256 != artifact bundle_refs_sha256')
+  pass('CHAIN_RESOLVED', `tip seq=${tip.seq} ${tip.txid.slice(0, 12)}… (kind=${artifact.kind})`)
+
+  const commitment = {
+    artifact_sha256: lc(artifact.json.artifact_sha256),
+    artifact_bytes: artifact.json.artifact_bytes,
+    bundle_refs_sha256: lc(artifact.json.bundle_refs_sha256),
+  }
+
+  // ---- verify the LOCAL bytes: git bundle verify + recompute all three fingerprints ----
+  const gv = gitBundleVerify(bundlePath)
+  if (!gv.ok) throw refusal('BUNDLE_VERIFY_FAILED', `git bundle verify failed on the local file:\n${gv.output}`)
+  pass('GIT_BUNDLE_VERIFY_OK')
+  const localBuf = readFileSync(bundlePath)
+  const local = {
+    artifact_sha256: sha256hex(localBuf),
+    artifact_bytes: localBuf.length,
+    bundle_refs_sha256: refsDigestOfBundle(bundlePath),
+  }
+  const mismatches = []
+  if (local.artifact_sha256 !== commitment.artifact_sha256) mismatches.push(`artifact_sha256: local ${local.artifact_sha256} != chain ${commitment.artifact_sha256}`)
+  if (local.artifact_bytes !== commitment.artifact_bytes) mismatches.push(`artifact_bytes: local ${local.artifact_bytes} != chain ${commitment.artifact_bytes}`)
+  if (local.bundle_refs_sha256 !== commitment.bundle_refs_sha256) mismatches.push(`bundle_refs_sha256: local ${local.bundle_refs_sha256} != chain ${commitment.bundle_refs_sha256}`)
+  if (mismatches.length) throw refusal('VERIFY_MISMATCH', `the local bundle does NOT match the on-chain commitment:\n  ${mismatches.join('\n  ')}`)
+  pass('ALL_THREE_FINGERPRINTS_MATCH')
+
+  const result = {
+    ok: true,
+    verified: true,
+    code: 'VERIFIED_LOCAL_BYTES_NOT_STORED_ON_CHAIN',
+    kind: artifact.kind, // what the on-chain manifest DECLARES
+    // VERIFY proves ONLY that the caller's LOCAL bytes match the on-chain commitment. It does NOT
+    // verify chain storage/reconstruction — the reader does that by walking the parts. So VERIFY
+    // must NOT claim `stored:true` off the manifest's self-declared kind (a git-bundle chain can
+    // have its manifest+ref mined while a PART tx never landed — the reader would REFUSE that with
+    // PART_NOT_FOUND). proof-only: the chain holds no bytes by design (kind is authoritative).
+    // git-bundle: the manifest DECLARES parts on chain, unverified here.
+    chain_storage: artifact.kind === 'proof-only' ? 'none' : 'declared-unverified',
+    bytes_source: 'local-file',
+    repo_id: repoId,
+    tip: { txid: tip.txid, seq: tip.seq, role: tip.role, pubkey: tip.pubkey },
+    bundle: bundlePath,
+    commitment,
+    local,
+  }
+  if (opts.report) writeFileSync(resolve(opts.report), JSON.stringify(result, null, 2))
+  if (!opts.quiet) {
+    console.log('\n=== bgit VERIFY: your LOCAL bundle matches the ON-CHAIN fingerprint ===')
+    console.log(`repo_id:            ${repoId}`)
+    console.log(`tip:                seq=${tip.seq} ${tip.txid} (kind=${artifact.kind})`)
+    console.log(`bundle:             ${bundlePath} (${local.artifact_bytes.toLocaleString('en-US')} bytes)`)
+    console.log('git bundle verify:  OK')
+    console.log(`artifact_sha256:    ${local.artifact_sha256}  == chain`)
+    console.log(`artifact_bytes:     ${local.artifact_bytes.toLocaleString('en-US')}  == chain`)
+    console.log(`bundle_refs_sha256: ${local.bundle_refs_sha256}  == chain`)
+    console.log(artifact.kind === 'proof-only'
+      ? 'THE CHAIN HOLDS ONLY THIS FINGERPRINT (proof-only). These bytes came from YOUR local file, not the chain — this proves they existed and are unchanged, NOT that the chain stores them.'
+      : 'The on-chain manifest DECLARES this a full git-bundle. VERIFY checked your LOCAL bytes against the commitment; it did NOT confirm the chain can reconstruct them — run the reader (without --verify) to prove chain reconstruction.')
+  }
+  return result
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 function parseArgs (argv) {
@@ -1033,6 +1278,8 @@ function parseArgs (argv) {
       case '--tx-url': o.txUrl = next(); break
       case '--source': o.source = next(); break
       case '--out': o.out = next(); break
+      case '--verify': o.verify = true; break
+      case '--bundle': o.bundle = next(); break
       case '--report': o.report = next(); break
       case '--quiet': o.quiet = true; break
       default: throw new Error(`unknown flag: ${a}`)
@@ -1046,7 +1293,9 @@ const isMain = (() => {
 })()
 
 if (isMain) {
-  runReader(parseArgs(process.argv.slice(2))).catch((e) => {
+  const opts = parseArgs(process.argv.slice(2))
+  const run = opts.verify ? runVerify : runReader
+  run(opts).catch((e) => {
     console.error(e.bgitCode ? e.message : `bgit reader: ${e.message}`)
     process.exit(e.bgitCode ? 2 : 1)
   })

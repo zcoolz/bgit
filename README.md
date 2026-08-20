@@ -19,9 +19,9 @@ with the repository URL.
 
 ## Why this exists
 
-In August 2026, India ordered GitHub to delete repositories on three hours' notice. The same
-season, Codeberg's new terms banned cryptocurrency projects from its platform — and, in the same
-vote, code written mostly by AI, naming Claude and Codex. (This repository, built with both,
+In July 2026, India ordered GitHub to delete repositories on three hours' notice. The same
+season, Codeberg's new terms banned cryptocurrency projects from its platform — and, around the
+same time, code written mostly by AI, naming Claude and Codex. (This repository, built with both,
 would be banned twice.) On a Monero community podcast,
 someone asked the obvious question — *"can we just store it on BSV?"* — and nobody in the room
 had an answer.
@@ -35,7 +35,8 @@ platforms have policies. Mined blocks don't.
 
 The first repository ever published in this format is [the format's own specification](./SPEC.md).
 The second is **Monero's repository history** — 13,241 commits, 8,463 refs, 257 MB, its own bundle in full (submodules are separate repositories; see the limits) — published
-as a labeled, claimable, unsigned mirror. Total cost: about six dollars, once.
+as a labeled, claimable **unsigned mirror**: meaning the project itself has not signed it, so any
+maintainer can later [claim it](#the-claim-mechanism--why-unsigned-mirror-matters). Total cost: about six dollars, once.
 
 ## How it works, in one breath
 
@@ -43,10 +44,16 @@ The **publisher** packs a repo with `git bundle` (git's own portable format), sl
 ~10 MB chunks, and writes each chunk into a transaction. Two small signed records join them on
 chain: an **artifact manifest** (the table of contents — every chunk's hash, plus the hash of the
 whole) and a **ref manifest** (which state is current, signed by the repo key). The **reader**
-reverses it from nothing but a transaction source: walk one address, collect the records, verify
+reverses it from nothing but a transaction source: walk one address (read every transaction that
+address has ever received), collect the records, verify
 every signature and every hash, refuse anything that doesn't check out — and hand you a `.bundle`
 file that stock git clones. That's the whole trick. Git objects were always content-addressed and
 immutable; they were waiting for a ledger with the same properties.
+
+bgit does this two ways: store the whole history on chain so it can be reconstructed (permanent,
+~$20/GB), or anchor only its fingerprint to prove it existed exactly as it was (notarization, a
+fraction of a cent — the bytes stay in your git). Most of this page is the first;
+[the second is below](#proof-only-publishing--anchor-a-repository-without-storing-it).
 
 ## Quickstart: reconstruct a repository from the chain
 
@@ -86,6 +93,12 @@ node publisher.mjs --bundle myrepo.bundle --repo you/myrepo \
   --broadcast --funding <txid>:<vout>:<sats> --bridge <your broadcast endpoint>
 ```
 
+`key.json` is `{"wif": "<a BSV WIF>"}`, and this key *is* your repository's identity. Its address
+becomes your `repo_id` — the string a reader passes to `--repo-id` to reconstruct you — and the dry
+run prints it (`repo_id: ...`) before anything is spent. The `--repo you/myrepo` value is only a
+human-readable label stored in the manifest; it is not what readers use to find the repo. Keep the
+key to publish updates: whoever holds it controls the chain.
+
 **Updating a published repository** — `--continue` publishes a new bundle onto an existing
 chain:
 
@@ -112,6 +125,57 @@ Cost at the proven fee floor (150 sat/KB): roughly **$20 per GB, once** — a ty
 full history lands between pennies and a few dollars. No renewal. No account. The measured
 receipt: Monero's entire 257 MB history cost ~40.4M satoshis (≈ $6 at time of publish) across 30
 transactions.
+
+## Proof-only publishing — anchor a repository without storing it
+
+Sometimes you don't need the bytes on chain, you need *proof* the bytes existed — exactly as they
+were, no later than a given moment, signed by a key you hold. That is notarization: prior-art and IP
+disputes, a dated release or a security-disclosure timeline, provenance for AI-generated code, or
+simply proving a git history was not backdated. The notary is Bitcoin — no timestamp authority, no
+calendar server, nothing that has to still be running years from now for the proof to hold.
+
+It costs a couple hundred satoshis, a fraction of a cent, instead of ~$20/GB — and unlike a full
+publish it does not scale with size: a 10 GB monorepo notarizes for the same couple hundred sats as
+a single-file gist, because only the fixed-size fingerprint goes on chain:
+
+```
+node publisher.mjs --bundle myrepo.bundle --repo you/myrepo --key-file key.json \
+  --proof-only --local-out ./fixture        # dry-run: two transactions, a couple hundred sats
+```
+
+To broadcast it for real, add the same `--broadcast --funding <txid>:<vout>:<sats> --bridge
+<endpoint>` a full publish uses: the identical two-transaction path, only without the chunk
+transactions.
+
+A proof-only publish writes the artifact manifest and the ref manifest — the same signed
+fingerprint an ordinary publish carries — and *no chunk transactions*. It proves **that this exact
+artifact existed, no later than this block, signed by this key, and unaltered since** — existence,
+not permanence: anyone who later holds a copy can re-hash it and check it against the on-chain
+commitment. It does **not** prove authorship — a signature attests control of a key, not that the
+signer wrote the code, the same distinction the claim mechanism draws below — nor permanence. The
+code stays in your git, not on chain, so lose every copy and the proof remains but the code is gone.
+
+The two promises are never allowed to blur. A proof-only publish declares itself in the signed
+record; the reader refuses anything that would let it read, report, or verify as bytes-on-chain, and
+a full permanent publish can never be silently downgraded to a proof. Reading a proof-only
+repository returns the fingerprint and a flat "the code is NOT on chain, keep your git copy," never
+a faked reconstruction. The normative seam is §11 of [SPEC.md](./SPEC.md).
+
+The proof-only seam was hardened the same way as the core format: a design pass and two adversarial
+rounds on the built code over the same cross-vendor review wire, with three defects and a
+compatibility caveat folded, none rebutted, each pinned to a red-proven test.
+
+To check a copy you already hold against the on-chain proof:
+
+```
+node reader.mjs --verify --repo-id <address> --bundle mycopy.bundle \
+  --history-url '<tpl>' --tx-url '<tpl>'
+```
+
+VERIFY requires your local bytes on purpose: it runs `git bundle verify`, recomputes all three
+fingerprints from *your* file, and compares them to the chain. A match means your copy is the one
+that was anchored, unaltered. A fingerprint checked against no bytes proves nothing, and VERIFY will
+never call that "verified."
 
 ## The claim mechanism — why "unsigned mirror" matters
 
@@ -166,14 +230,23 @@ ruled on the genesis paradox, same-block ordering, and claim permanence. Every f
 none was rebutted; the full verdicts live in [SPEC.md](./SPEC.md)'s review record — the trial
 transcript ships inside the law.
 
+One caveat we will not leave for you to raise: these were model-driven adversarial reviews — Codex
+against a Claude-built design, two rival labs' models on one wire — not a professional third-party
+cryptographic audit, and none has been done. They caught real, specific, folded findings; model
+review has its own blind spots too. Treat the trial record as evidence of adversarial pressure, not
+as a security certification.
+
 The reader has its own origin discipline: it was implemented by someone given *only the spec
 text*, and every place they had to guess became a formal finding — [AUDIT.md](./AUDIT.md) lists
 all 13, each dispositioned. Two became normative security law. If you implement your own reader
 (please do), start there.
 
-Run the vectors yourself: `npm test` — 22 pins covering signature vectors verified across two
+Run the vectors yourself: `npm test` — 49 pins covering signature vectors verified across two
 independent implementations, every rejection class, fork races at every height, claim replay,
-version-coexistence, and an end-to-end publish→reconstruct→clone loop.
+version-coexistence, an end-to-end publish→reconstruct→clone loop, and the §11 proof-only kind (the
+closed-enum classifier, the storage cross-check, reconstruction refusal, the ancestor recover walk,
+the VERIFY verb and the downgrade gate — each with a red-control that breaks the guard and confirms
+it bites).
 
 ## Designed for our own death
 
@@ -199,8 +272,22 @@ as a spec:
 - **Permanence means erasure-resistance while one archival copy exists** — and anyone may run
   one. That is a different (and better) failure mode than a platform, where one policy decision
   deletes the canonical copy. It is not magic.
+- **Proof-only proves existence, not permanence — and not authorship, or first place.** A proof-only
+  publish (notarization) anchors only the fingerprint; the bytes never go on chain, so lose every
+  copy of your git repository and the proof still stands, but it cannot hand the code back. It proves
+  a specific key signed a specific bundle no later than a specific block. It does not prove the signer
+  wrote the code, that the bundle matches its `repo` label (that field is self-asserted), or that no
+  one holds an earlier proof of the same bytes — for already-public code anyone can fingerprint the
+  same bytes and anchor them earlier, so it shows "existed by then," not "existed first," and is
+  strongest for bytes that were never public before you anchored them. And no proof-only publish has
+  been broadcast to chain yet (the kind shipped 2026-08-19), so the cost figures above are the
+  dry-run plan, not a measured receipt like Monero's.
 - **Signatures cannot prove freshness.** A frozen ref chain is undetectable from one source, and
   neither is withholding — a single source cannot prove absence. Read from several.
+- **"Forever" is bounded by the primitives.** Integrity and authenticity here rest on SHA-256 and
+  secp256k1/ECDSA; if either is broken, "unaltered since" and "signed by this key" weaken with it.
+  The version byte and the read-old-forever rule are the migration path for that day — nothing in v1
+  pretends the math is eternal, only that the format can outlive any one algorithm.
 - **Miners and nodes are not obliged to retain or serve historical payloads.** Nothing compels
   anyone to keep your data reachable. That is exactly why the reader is open and the format is
   documented: being the archive requires no permission, and the set of people who can be one is
